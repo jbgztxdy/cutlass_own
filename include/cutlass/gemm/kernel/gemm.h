@@ -236,6 +236,7 @@ struct Gemm {
 
     // Compute position within threadblock
     int thread_idx = threadIdx.x;
+    // printf("Threadblock swizzle tile offset: (%d, %d, %d)\n", threadblock_tile_offset.m(), threadblock_tile_offset.n(), threadblock_tile_offset.k());
 
     // Construct iterators to A and B operands
     typename Mma::IteratorA iterator_A(
