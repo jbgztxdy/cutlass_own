@@ -97,6 +97,8 @@ foreach(EXAMPLE
   13_two_tensor_op_fusion
   14_ampere_tf32_tensorop_gemm
   14_ampere_tf32_tensorop_gemm_new
+  14_ampere_tf32_tensorop_gemm_multigpu
+  14_ampere_tf32_tensorop_gemm_multigpu_new
   15_ampere_sparse_tensorop_gemm
   16_ampere_tensorop_conv2dfprop
   17_fprop_per_channel_bias
