@@ -53,6 +53,74 @@ namespace threadblock {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename Iterator>
+CUTLASS_DEVICE auto software_cache_enabled(Iterator const &iterator, int)
+  -> decltype(iterator.software_cache_enabled()) {
+  return iterator.software_cache_enabled();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE bool software_cache_enabled(Iterator const &, long) {
+  return false;
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE auto is_remote_cache_candidate(Iterator const &iterator, int)
+  -> decltype(iterator.is_remote_cache_candidate()) {
+  return iterator.is_remote_cache_candidate();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE bool is_remote_cache_candidate(Iterator const &, long) {
+  return false;
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE auto software_cache_local_ptr(Iterator const &iterator, int)
+  -> decltype(iterator.get_software_cache_local_ptr()) {
+  return iterator.get_software_cache_local_ptr();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE typename Iterator::AccessType *software_cache_local_ptr(Iterator const &, long) {
+  return nullptr;
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE auto software_cache_tile_state_ptr(Iterator const &iterator, int)
+  -> decltype(iterator.get_software_cache_tile_state_ptr()) {
+  return iterator.get_software_cache_tile_state_ptr();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE int *software_cache_tile_state_ptr(Iterator const &, long) {
+  return nullptr;
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE auto set_software_cache_stage_mode(
+  Iterator &iterator, bool use_local, int)
+  -> decltype(iterator.set_software_cache_stage_mode(use_local), void()) {
+  iterator.set_software_cache_stage_mode(use_local);
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE void set_software_cache_stage_mode(
+  Iterator &, bool, long) { }
+
+template <typename Iterator>
+CUTLASS_DEVICE auto resolve_software_cache_stage_use_local(
+  Iterator const &iterator, int)
+  -> decltype(iterator.resolve_software_cache_stage_use_local()) {
+  return iterator.resolve_software_cache_stage_use_local();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE bool resolve_software_cache_stage_use_local(
+  Iterator const &, long) {
+  return false;
+}
+
 /// Structure to compute the matrix product targeting CUDA cores and SIMT math
 /// instructions.
 template <
@@ -284,12 +352,115 @@ public:
     }
   }
 
+  template <typename Iterator>
+  CUTLASS_DEVICE
+  void prepare_software_cache_stage(Iterator &iterator) {
+    bool use_local = software_cache_enabled(iterator, 0) &&
+                     resolve_software_cache_stage_use_local(iterator, 0);
+    set_software_cache_stage_mode(iterator, use_local, 0);
+  }
+
+  template <typename Iterator, typename SmemIterator, int StageIterations>
+  CUTLASS_DEVICE
+  void cache_operand_stage(Iterator iterator, SmemIterator smem_iterator) {
+    if (!software_cache_enabled(iterator, 0)) {
+      return;
+    }
+
+    __shared__ int *tile_state_ptr;
+    __shared__ int should_fill_tile;
+
+    if (threadIdx.x == 0) {
+      tile_state_ptr = nullptr;
+      should_fill_tile = 0;
+
+      Iterator probe_iterator = iterator;
+      probe_iterator.set_iteration_index(0);
+
+      int *tile_state = software_cache_tile_state_ptr(probe_iterator, 0);
+
+      if (tile_state) {
+        tile_state_ptr = tile_state;
+        int prior_state = atomicCAS(
+          tile_state,
+          int(gemm::kSoftwareCacheLineInvalid),
+          int(gemm::kSoftwareCacheLineFilling));
+        should_fill_tile = (prior_state == int(gemm::kSoftwareCacheLineInvalid));
+      }
+    }
+
+    __syncthreads();
+
+    if (!tile_state_ptr || !should_fill_tile) {
+      return;
+    }
+
+    iterator.set_iteration_index(0);
+    smem_iterator.set_iteration_index(0);
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < StageIterations; ++j) {
+      typename Iterator::AccessType *smem_ptr =
+          reinterpret_cast<typename Iterator::AccessType *>(smem_iterator.get());
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int v = 0; v < Iterator::kAccessesPerVector; ++v) {
+        if (iterator.valid()) {
+          typename Iterator::AccessType *local_ptr = software_cache_local_ptr(iterator, 0);
+          if (local_ptr) {
+            *local_ptr = smem_ptr[v];
+          }
+        }
+
+        ++iterator;
+      }
+
+      ++smem_iterator;
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+      __threadfence();
+      *tile_state_ptr = int(gemm::kSoftwareCacheLineValid);
+    }
+  }
+
+  CUTLASS_DEVICE
+  void cache_fetched_stage(
+    IteratorA &cache_iterator_A,
+    IteratorB &cache_iterator_B,
+    SmemIteratorA &cache_smem_iterator_A,
+    SmemIteratorB &cache_smem_iterator_B,
+    int &cache_smem_stage_idx) {
+    cache_operand_stage<IteratorA, SmemIteratorA, Detail::AsyncCopyIterationsPerStageA>(
+      cache_iterator_A, cache_smem_iterator_A);
+    cache_operand_stage<IteratorB, SmemIteratorB, Detail::AsyncCopyIterationsPerStageB>(
+      cache_iterator_B, cache_smem_iterator_B);
+
+    cache_iterator_A.add_tile_offset({0, 1});
+    cache_iterator_B.add_tile_offset({1, 0});
+
+    cache_smem_iterator_A.add_tile_offset({0, 1});
+    cache_smem_iterator_B.add_tile_offset({1, 0});
+
+    ++cache_smem_stage_idx;
+    if (cache_smem_stage_idx == Base::kStages) {
+      cache_smem_iterator_A.add_tile_offset({0, -Base::kStages});
+      cache_smem_iterator_B.add_tile_offset({-Base::kStages, 0});
+      cache_smem_stage_idx = 0;
+    }
+  }
+
   CUTLASS_DEVICE
   void copy_tiles_and_advance(IteratorA &iterator_A, IteratorB &iterator_B,
                               int group_start_A = 0, int group_start_B = 0) {
     iterator_A.set_iteration_index(group_start_A *
                                    IteratorA::kAccessesPerVector);
     this->smem_iterator_A_.set_iteration_index(group_start_A);
+    if (group_start_A == 0) {
+      prepare_software_cache_stage(iterator_A);
+    }
 
     // Async Copy for operand A
     CUTLASS_PRAGMA_UNROLL
@@ -325,6 +496,9 @@ public:
     iterator_B.set_iteration_index(group_start_B *
                                    IteratorB::kAccessesPerVector);
     this->smem_iterator_B_.set_iteration_index(group_start_B);
+    if (group_start_B == 0) {
+      prepare_software_cache_stage(iterator_B);
+    }
 
     // Async Copy for operand B
     CUTLASS_PRAGMA_UNROLL
@@ -375,6 +549,7 @@ public:
 
       iterator_A.set_iteration_index(0);
       this->smem_iterator_A_.set_iteration_index(0);
+      prepare_software_cache_stage(iterator_A);
 
       // Async Copy for operand A
       CUTLASS_PRAGMA_UNROLL
@@ -403,6 +578,7 @@ public:
 
       iterator_B.set_iteration_index(0);
       this->smem_iterator_B_.set_iteration_index(0);
+      prepare_software_cache_stage(iterator_B);
 
       // Async Copy for operand B
       CUTLASS_PRAGMA_UNROLL
@@ -483,10 +659,27 @@ public:
 
   /// Wait until we have at least one completed global fetch stage
   CUTLASS_DEVICE
-  void gmem_wait()
+  void gmem_wait(
+    IteratorA &cache_iterator_A,
+    IteratorB &cache_iterator_B,
+    SmemIteratorA &cache_smem_iterator_A,
+    SmemIteratorB &cache_smem_iterator_B,
+    int &cache_smem_stage_idx)
   {
     // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
     cutlass::arch::cp_async_wait<Base::kStages - 2>();
+
+    bool cache_A = software_cache_enabled(cache_iterator_A, 0);
+    bool cache_B = software_cache_enabled(cache_iterator_B, 0);
+    if (!(cache_A || cache_B)) {
+      __syncthreads();
+      return;
+    }
+
+    cache_fetched_stage(
+      cache_iterator_A, cache_iterator_B,
+      cache_smem_iterator_A, cache_smem_iterator_B,
+      cache_smem_stage_idx);
     __syncthreads();
   }
 
@@ -498,6 +691,11 @@ public:
     FragmentC &accum,               ///< [in|out] destination accumulator tile
     IteratorA &iterator_A,          ///< [in|out] iterator over A operand in global memory
     IteratorB &iterator_B,          ///< [in|out] iterator over B operand in global memory
+    IteratorA &cache_iterator_A,
+    IteratorB &cache_iterator_B,
+    SmemIteratorA &cache_smem_iterator_A,
+    SmemIteratorB &cache_smem_iterator_B,
+    int &cache_smem_stage_idx,
     int &gemm_k_iterations)         ///< [in|out] number of threadblock mainloop iterations remaining
   {
     // Unroll the warp-level MMA tiles of a threadblock's mainloop iteration
@@ -580,7 +778,12 @@ public:
         cutlass::arch::cp_async_fence();
 
         // Wait until we have at least one completed global fetch stage
-        gmem_wait();
+        gmem_wait(
+          cache_iterator_A,
+          cache_iterator_B,
+          cache_smem_iterator_A,
+          cache_smem_iterator_B,
+          cache_smem_stage_idx);
 
         // Move to the next global fetch stage
         advance_smem_write_stage(iterator_A, iterator_B);
@@ -615,7 +818,12 @@ public:
       int gemm_k_iterations,        ///< number of threadblock mainloop iterations
       FragmentC &accum,             ///< [in|out] accumulator tile
       IteratorA &iterator_A,        ///< [in|out] iterator over A operand in global memory
-      IteratorB &iterator_B)        ///< [in|out] iterator over B operand in global memory
+      IteratorB &iterator_B,        ///< [in|out] iterator over B operand in global memory
+      IteratorA &cache_iterator_A,
+      IteratorB &cache_iterator_B,
+      SmemIteratorA &cache_smem_iterator_A,
+      SmemIteratorB &cache_smem_iterator_B,
+      int &cache_smem_stage_idx)
   {
     PipeState pipe_state;
 
@@ -652,6 +860,11 @@ public:
         accum,
         iterator_A,
         iterator_B,
+        cache_iterator_A,
+        cache_iterator_B,
+        cache_smem_iterator_A,
+        cache_smem_iterator_B,
+        cache_smem_stage_idx,
         gemm_k_iterations);
     }
 
@@ -716,18 +929,32 @@ public:
       IteratorB iterator_B,
       ///< initial value of accumulator
       FragmentC const &src_accum) {
+    IteratorA cache_iterator_A = iterator_A;
+    IteratorB cache_iterator_B = iterator_B;
+    SmemIteratorA cache_smem_iterator_A = smem_iterator_A_;
+    SmemIteratorB cache_smem_iterator_B = smem_iterator_B_;
+    int cache_smem_stage_idx = 0;
 
     // Prologue (start fetching iterations of global fragments into shared memory)
-    prologue(iterator_A, iterator_B, gemm_k_iterations);
+    prologue(
+      iterator_A, iterator_B,
+      gemm_k_iterations);
 
     // Wait until we have at least one completed global fetch stage
-    gmem_wait();
+    gmem_wait(
+      cache_iterator_A, cache_iterator_B,
+      cache_smem_iterator_A, cache_smem_iterator_B,
+      cache_smem_stage_idx);
 
     // Initialize destination accumulators with source accumulators
     accum = src_accum;
 
     // Perform the MAC-iterations
-    gemm_iters(gemm_k_iterations, accum, iterator_A, iterator_B);
+    gemm_iters(
+      gemm_k_iterations, accum, iterator_A, iterator_B,
+      cache_iterator_A, cache_iterator_B,
+      cache_smem_iterator_A, cache_smem_iterator_B,
+      cache_smem_stage_idx);
   }
 
   // Expose pipeline state via alias without changing its original access level
@@ -741,4 +968,3 @@ public:
 }  // namespace cutlass
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-

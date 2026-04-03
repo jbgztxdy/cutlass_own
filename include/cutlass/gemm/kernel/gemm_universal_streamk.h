@@ -42,6 +42,7 @@
 #include "cutlass/complex.h"
 #include "cutlass/barrier.h"
 #include "cutlass/block_striped.h"
+#include "cutlass/gemm/software_cache.h"
 
 #include "cutlass/trace.h"
 
@@ -149,6 +150,8 @@ public:
     typename LayoutC::Stride::LongIndex ldd{0};
 
     int avail_sms{-1};          /// The number of SMs that StreamK dispatch heuristics will attempt to load-balance across (-1 defaults to device width, 1 implies classic data-parallel scheduling)
+    gemm::SoftwareCacheDescriptor software_cache_A{};
+    gemm::SoftwareCacheDescriptor software_cache_B{};
 
 
     //
@@ -234,6 +237,7 @@ public:
       std::swap(args.lda, args.ldb);
       std::swap(args.stride_a, args.stride_b);
       std::swap(args.batch_stride_A, args.batch_stride_B);
+      std::swap(args.software_cache_A, args.software_cache_B);
 
       return args;
     }
@@ -254,6 +258,8 @@ public:
 
     typename Mma::IteratorA::Params params_A{};
     typename Mma::IteratorB::Params params_B{};
+    gemm::SoftwareCacheDescriptor software_cache_A{};
+    gemm::SoftwareCacheDescriptor software_cache_B{};
 
     int64_t batch_stride_A{0};
     int64_t batch_stride_B{0};
@@ -338,9 +344,14 @@ public:
       batch_stride_B(args.batch_stride_B),
       batch_stride_C(args.batch_stride_C),
       batch_stride_D(args.batch_stride_D),
+      software_cache_A(args.software_cache_A),
+      software_cache_B(args.software_cache_B),
       barrier_workspace(nullptr),
       partials_workspace(nullptr)
     {
+      params_A.set_software_cache(software_cache_A);
+      params_B.set_software_cache(software_cache_B);
+
       // Number of SMs to make available for StreamK decomposition
       int avail_sms = (args.avail_sms == -1) ?
                         device_sms :
@@ -461,6 +472,10 @@ public:
       batch_stride_B = args.batch_stride_B;
       batch_stride_C = args.batch_stride_C;
       batch_stride_D = args.batch_stride_D;
+      software_cache_A = args.software_cache_A;
+      software_cache_B = args.software_cache_B;
+      params_A.set_software_cache(software_cache_A);
+      params_B.set_software_cache(software_cache_B);
 
       output_op = args.epilogue;
     }

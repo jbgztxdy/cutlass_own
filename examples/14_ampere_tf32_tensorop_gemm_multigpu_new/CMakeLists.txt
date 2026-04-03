@@ -33,3 +33,7 @@ cutlass_example_add_executable(
   ampere_tf32_tensorop_gemm.cu
   )
 
+cutlass_example_add_executable(
+  cp_async_nvlink_bandwidth
+  cp_async_nvlink_bandwidth.cu
+  )

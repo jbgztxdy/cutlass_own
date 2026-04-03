@@ -49,18 +49,29 @@ Passed
 
 之后测试多GPU上的性能（GPU0上存数据，GPU1取址或访问），发现性能最好的为配置24：
 ```
-yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu/14_ampere_tf32_tensorop_gemm_multigpu --storage-device=0 --compute-device=1
+(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu/14_ampere_tf32_tensorop_gemm_multigpu --storage-device=0 --compute-device=1
 5120 x 4096 x 4096 TF32 tensor op Matrix Multiply
 Storage GPU: 0, Compute GPU: 1
 Note: Kernel will access data remotely via PCIe/UVA
-Runtime: 24.6825 ms
- GFLOPs: 6960.34
+Runtime: 22.6489 ms
+ GFLOPs: 7585.29
 Passed
-yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=24 --storage-device=0 --compute-device=1
+(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=24 --storage-device=0 --compute-device=1
 5120 x 4096 x 4096 TF32 tensor op Matrix Multiply
 Storage GPU: 0, Compute GPU: 1
 Note: Kernel will access data remotely via PCIe/UVA
-Runtime: 16.9419 ms
- GFLOPs: 10140.5
+Runtime: 15.5834 ms
+ GFLOPs: 11024.5
+Passed
+```
+加入大缓存：
+```
+(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=12 --storage-device=0 --compute-device=1 --software
+-cache=1
+5120 x 4096 x 4096 TF32 tensor op Matrix Multiply
+Storage GPU: 0, Compute GPU: 1
+Note: Kernel will access data remotely via PCIe/UVA
+Runtime: 5.73711 ms
+ GFLOPs: 29945.1
 Passed
 ```

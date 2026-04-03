@@ -47,6 +47,7 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/params_universal_base.h"
+#include "cutlass/gemm/software_cache.h"
 #include "cutlass/trace.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -142,6 +143,8 @@ public:
     int const * ptr_gather_A_indices;
     int const * ptr_gather_B_indices;
     int const * ptr_scatter_D_indices;
+    gemm::SoftwareCacheDescriptor software_cache_A;
+    gemm::SoftwareCacheDescriptor software_cache_B;
 
     //
     // Methods
@@ -151,7 +154,9 @@ public:
       ptr_A(nullptr), ptr_B(nullptr), ptr_C(nullptr), ptr_D(nullptr),
       ptr_gather_A_indices(nullptr),
       ptr_gather_B_indices(nullptr),
-      ptr_scatter_D_indices(nullptr)
+      ptr_scatter_D_indices(nullptr),
+      software_cache_A(),
+      software_cache_B()
     {}
 
     /// constructs an arguments structure
@@ -182,7 +187,9 @@ public:
       batch_stride_A(batch_stride_A), batch_stride_B(batch_stride_B), batch_stride_C(batch_stride_C),
       stride_a(stride_a), stride_b(stride_b), stride_c(stride_c), stride_d(stride_d),
       ptr_gather_A_indices(ptr_gather_A_indices), ptr_gather_B_indices(ptr_gather_B_indices),
-      ptr_scatter_D_indices(ptr_scatter_D_indices)
+      ptr_scatter_D_indices(ptr_scatter_D_indices),
+      software_cache_A(),
+      software_cache_B()
     {
       lda = 0;
       ldb = 0;
@@ -219,7 +226,9 @@ public:
       batch_stride_A(batch_stride_A), batch_stride_B(batch_stride_B), batch_stride_C(batch_stride_C),
       lda(lda), ldb(ldb), ldc(ldc), ldd(ldd),
       ptr_gather_A_indices(ptr_gather_A_indices), ptr_gather_B_indices(ptr_gather_B_indices),
-      ptr_scatter_D_indices(ptr_scatter_D_indices)
+      ptr_scatter_D_indices(ptr_scatter_D_indices),
+      software_cache_A(),
+      software_cache_B()
     {
       stride_a = make_Coord(lda);
       stride_b = make_Coord(ldb);
@@ -239,6 +248,7 @@ public:
       std::swap(args.stride_a, args.stride_b);
       std::swap(args.batch_stride_A, args.batch_stride_B);
       std::swap(args.ptr_gather_A_indices, args.ptr_gather_B_indices);
+      std::swap(args.software_cache_A, args.software_cache_B);
 
       return args;
     }
@@ -291,6 +301,8 @@ public:
     int * ptr_gather_A_indices;
     int * ptr_gather_B_indices;
     int * ptr_scatter_D_indices;
+    gemm::SoftwareCacheDescriptor software_cache_A;
+    gemm::SoftwareCacheDescriptor software_cache_B;
 
     //
     // Host dispatch API
@@ -320,8 +332,13 @@ public:
       batch_stride_C(args.batch_stride_C),
       ptr_gather_A_indices(const_cast<int *>(args.ptr_gather_A_indices)),
       ptr_gather_B_indices(const_cast<int *>(args.ptr_gather_B_indices)),
-      ptr_scatter_D_indices(const_cast<int *>(args.ptr_scatter_D_indices))
-    {}
+      ptr_scatter_D_indices(const_cast<int *>(args.ptr_scatter_D_indices)),
+      software_cache_A(args.software_cache_A),
+      software_cache_B(args.software_cache_B)
+    {
+      params_A.set_software_cache(software_cache_A);
+      params_B.set_software_cache(software_cache_B);
+    }
 
     /// Lightweight update given a subset of arguments.
     void update(Arguments const &args)
@@ -342,6 +359,10 @@ public:
       ptr_gather_A_indices = const_cast<int *>(args.ptr_gather_A_indices);
       ptr_gather_B_indices = const_cast<int *>(args.ptr_gather_B_indices);
       ptr_scatter_D_indices = const_cast<int *>(args.ptr_scatter_D_indices);
+      software_cache_A = args.software_cache_A;
+      software_cache_B = args.software_cache_B;
+      params_A.set_software_cache(software_cache_A);
+      params_B.set_software_cache(software_cache_B);
 
       output_op = args.epilogue;
     }

@@ -54,6 +54,7 @@
 #include "cutlass/predicate_vector.h"
 #include "cutlass/tensor_ref.h"
 #include "cutlass/tensor_view.h"
+#include "cutlass/gemm/software_cache.h"
 #include "cutlass/transform/threadblock/predicated_tile_access_iterator_params.h"
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -370,6 +371,8 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
     
     using Base = PredicatedTileAccessIteratorParams;
 
+    gemm::SoftwareCacheDescriptor software_cache;
+
     /// Default constructor
     Params() = default;
 
@@ -383,6 +386,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
     CUTLASS_HOST_DEVICE
     Params(Base const &base) : 
       Base(base) { }
+
+    CUTLASS_HOST_DEVICE
+    void set_software_cache(gemm::SoftwareCacheDescriptor const &descriptor) {
+      software_cache = descriptor;
+    }
   };
 
  private:
@@ -421,6 +429,10 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
   /// - when Gather is true, strided coordinate needed to access indices (contiguous offset is tracked via pointer_)
   /// - when Permute is true, both coordinates are needed as input into permutation function (pointer_ is fixed)
   TensorCoord coord_offset_;
+
+  /// Stage-scoped cache routing decision. -1 means "dynamic lookup", 0 means
+  /// "use remote", and 1 means "use local mirror".
+  int software_cache_stage_mode_ = -1;
 
  private:
   /// Computes predicates based on internally tracked per-thread offset.
@@ -462,10 +474,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
         indices_(indices),
         permute_layout_(TensorCoord(extent.contiguous(), extent.strided()), params.stride_) {
 
-    the_predicates.set_predicates(thread_id, threadblock_offset);
-          
-    if (Gather) {
-      assert(indices_);
+	  the_predicates.set_predicates(thread_id, threadblock_offset);
+      coord_offset_ = the_predicates.thread_offset_;
+	          
+	    if (Gather) {
+	      assert(indices_);
     }
 
     // update internal pointers
@@ -525,9 +538,15 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
         if (kAdvanceRank) {
           pointer_ += params_.inc_advance_ * LongIndex(tile_offset.strided() - 1);
           pointer_ += Shape::kContiguous * tile_offset.contiguous() * sizeof_bits<Element>::value / 8;
+          coord_offset_ = the_predicates.thread_offset_ +
+            TensorCoord(Shape::kContiguous * tile_offset.contiguous(),
+                        Shape::kStrided * (tile_offset.strided() - 1));
         } else {
           pointer_ += params_.inc_advance_ * LongIndex(tile_offset.contiguous() - 1);
           pointer_ += Shape::kStrided * tile_offset.strided() * sizeof_bits<Element>::value / 8;
+          coord_offset_ = the_predicates.thread_offset_ +
+            TensorCoord(Shape::kContiguous * (tile_offset.contiguous() - 1),
+                        Shape::kStrided * tile_offset.strided());
         }
       } else {
         coord_offset_.strided() = the_predicates.thread_offset_.strided() + Shape::kStrided * (tile_offset.strided() - kAdvanceRank);
@@ -543,9 +562,13 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
         if (kAdvanceRank) {
           pointer_ += params_.inc_advance_ * LongIndex(tile_offset.strided());
           pointer_ += Shape::kContiguous * tile_offset.contiguous();
+          coord_offset_ += TensorCoord(Shape::kContiguous * tile_offset.contiguous(),
+                                       Shape::kStrided * tile_offset.strided());
         } else {
           pointer_ += params_.inc_advance_ * LongIndex(tile_offset.contiguous());
           pointer_ += Shape::kStrided * tile_offset.strided();
+          coord_offset_ += TensorCoord(Shape::kContiguous * tile_offset.contiguous(),
+                                       Shape::kStrided * tile_offset.strided());
         }
       } else {
         coord_offset_.strided() += Shape::kStrided * tile_offset.strided();
@@ -563,6 +586,38 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
   /// Returns a pointer
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
+    AccessType *remote_ptr = get_remote();
+
+    if (!software_cache_enabled() || !remote_ptr) {
+      return remote_ptr;
+    }
+
+    if (software_cache_stage_mode_ == 1) {
+      return reinterpret_cast<AccessType *>(
+        reinterpret_cast<char *>(remote_ptr) +
+        params_.software_cache.local_minus_remote_offset);
+    }
+
+    if (software_cache_stage_mode_ == 0) {
+      return remote_ptr;
+    }
+
+    LongIndex byte_offset = 0;
+    int tile_idx = -1;
+
+    if (get_software_cache_lookup(remote_ptr, byte_offset, tile_idx)) {
+      int *tile_state = params_.software_cache.tile_states + tile_idx;
+      if (*tile_state == gemm::kSoftwareCacheLineValid) {
+        return reinterpret_cast<AccessType *>(
+          reinterpret_cast<char *>(params_.software_cache.local_base) + byte_offset);
+      }
+    }
+
+    return remote_ptr;
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_remote() const {
 
     if (Gather || Permute)
     {
@@ -583,6 +638,143 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
     return reinterpret_cast<AccessType *>(
         pointer_ + 
         the_predicates.iteration_contiguous_ * (ThreadMap::Delta::kContiguous * sizeof_bits<Element>::value) / 8) + the_predicates.iteration_vector_;
+  }
+
+  CUTLASS_HOST_DEVICE
+  TensorCoord get_current_coord() const {
+    if (Gather || Permute) {
+      if (!valid()) {
+        return TensorCoord(0, 0);
+      }
+
+      Index coord_contig =
+        (Permute ? coord_offset_.contiguous() : 0) +
+        the_predicates.iteration_contiguous_ * ThreadMap::Delta::kContiguous +
+        the_predicates.iteration_vector_ * AccessType::kElements;
+      Index coord_strided =
+        coord_offset_.strided() +
+        the_predicates.iteration_strided_ * ThreadMap::Delta::kStrided;
+
+      if (Gather) {
+        coord_strided = indices_[coord_strided];
+      }
+
+      return TensorCoord(coord_contig, coord_strided);
+    }
+
+    return TensorCoord(
+      coord_offset_.contiguous() +
+        the_predicates.iteration_contiguous_ * ThreadMap::Delta::kContiguous +
+        the_predicates.iteration_vector_ * AccessType::kElements,
+      coord_offset_.strided() +
+        the_predicates.iteration_strided_ * ThreadMap::Delta::kStrided);
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool software_cache_enabled() const {
+    return params_.software_cache.is_enabled();
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_software_cache_stage_mode(bool use_local) {
+    software_cache_stage_mode_ = use_local ? 1 : 0;
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_software_cache_stage_mode() {
+    software_cache_stage_mode_ = -1;
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool resolve_software_cache_stage_use_local() const {
+    AccessType *remote_ptr = get_remote();
+    LongIndex byte_offset = 0;
+    int tile_idx = -1;
+
+    if (!get_software_cache_lookup(remote_ptr, byte_offset, tile_idx)) {
+      return false;
+    }
+
+    int *tile_state = params_.software_cache.tile_states + tile_idx;
+    return (*tile_state == gemm::kSoftwareCacheLineValid);
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool get_software_cache_lookup(
+    AccessType *remote_ptr,
+    LongIndex &byte_offset,
+    int &tile_idx) const {
+    if (!software_cache_enabled() || !remote_ptr || !valid()) {
+      return false;
+    }
+
+    char const *remote_base = reinterpret_cast<char const *>(params_.software_cache.remote_base);
+    char const *remote_byte_ptr = reinterpret_cast<char const *>(remote_ptr);
+    byte_offset = remote_byte_ptr - remote_base;
+
+    if (byte_offset < 0 || byte_offset >= params_.software_cache.remote_bytes) {
+      return false;
+    }
+
+    TensorCoord coord = get_current_coord();
+    int tile_contiguous = coord.contiguous() / params_.software_cache.tile_shape_contiguous;
+    int tile_strided = coord.strided() / params_.software_cache.tile_shape_strided;
+
+    if (tile_contiguous < 0 || tile_contiguous >= params_.software_cache.tile_count_contiguous) {
+      return false;
+    }
+    if (tile_strided < 0 || tile_strided >= params_.software_cache.tile_count_strided) {
+      return false;
+    }
+
+    tile_idx = tile_strided * params_.software_cache.tile_count_contiguous + tile_contiguous;
+    return true;
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool is_remote_cache_candidate() const {
+    AccessType *remote_ptr = get_remote();
+    LongIndex byte_offset = 0;
+    int tile_idx = -1;
+    return get_software_cache_lookup(remote_ptr, byte_offset, tile_idx);
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_software_cache_local_ptr() const {
+    AccessType *remote_ptr = get_remote();
+    LongIndex byte_offset = 0;
+    int tile_idx = -1;
+
+    if (!get_software_cache_lookup(remote_ptr, byte_offset, tile_idx)) {
+      return nullptr;
+    }
+
+    return reinterpret_cast<AccessType *>(
+      reinterpret_cast<char *>(remote_ptr) +
+      params_.software_cache.local_minus_remote_offset);
+  }
+
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_tile_index() const {
+    AccessType *remote_ptr = get_remote();
+    LongIndex byte_offset = 0;
+    int tile_idx = -1;
+
+    if (!get_software_cache_lookup(remote_ptr, byte_offset, tile_idx)) {
+      return -1;
+    }
+
+    return tile_idx;
+  }
+
+  CUTLASS_HOST_DEVICE
+  int *get_software_cache_tile_state_ptr() const {
+    int tile_idx = get_software_cache_tile_index();
+    if (tile_idx < 0) {
+      return nullptr;
+    }
+
+    return params_.software_cache.tile_states + tile_idx;
   }
 
   /// Increment and return an instance to self.
@@ -741,6 +933,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajor,
     CUTLASS_HOST_DEVICE
     Params(typename UnderlyingIterator::Params::Base const &base) 
         : params_(base) {}
+
+    CUTLASS_HOST_DEVICE
+    void set_software_cache(gemm::SoftwareCacheDescriptor const &descriptor) {
+      params_.set_software_cache(descriptor);
+    }
   };
 
  private:
@@ -811,6 +1008,51 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajor,
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
     return reinterpret_cast<AccessType *>(iterator_.get());
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_remote() const {
+    return reinterpret_cast<AccessType *>(iterator_.get_remote());
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool software_cache_enabled() const {
+    return iterator_.software_cache_enabled();
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_software_cache_stage_mode(bool use_local) {
+    iterator_.set_software_cache_stage_mode(use_local);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_software_cache_stage_mode() {
+    iterator_.clear_software_cache_stage_mode();
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool resolve_software_cache_stage_use_local() const {
+    return iterator_.resolve_software_cache_stage_use_local();
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool is_remote_cache_candidate() const {
+    return iterator_.is_remote_cache_candidate();
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_software_cache_local_ptr() const {
+    return reinterpret_cast<AccessType *>(iterator_.get_software_cache_local_ptr());
+  }
+
+  CUTLASS_HOST_DEVICE
+  int *get_software_cache_tile_state_ptr() const {
+    return iterator_.get_software_cache_tile_state_ptr();
+  }
+
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_tile_index() const {
+    return iterator_.get_software_cache_tile_index();
   }
 
   /// Advances to the next tile in memory.
@@ -931,6 +1173,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajor,
     CUTLASS_HOST_DEVICE
     Params(typename UnderlyingIterator::Params::Base const &base) 
         : params_(base) {}
+
+    CUTLASS_HOST_DEVICE
+    void set_software_cache(gemm::SoftwareCacheDescriptor const &descriptor) {
+      params_.set_software_cache(descriptor);
+    }
   };
 
  private:
@@ -1001,6 +1248,51 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajor,
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
     return reinterpret_cast<AccessType *>(iterator_.get());
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_remote() const {
+    return reinterpret_cast<AccessType *>(iterator_.get_remote());
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool software_cache_enabled() const {
+    return iterator_.software_cache_enabled();
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_software_cache_stage_mode(bool use_local) {
+    iterator_.set_software_cache_stage_mode(use_local);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_software_cache_stage_mode() {
+    iterator_.clear_software_cache_stage_mode();
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool resolve_software_cache_stage_use_local() const {
+    return iterator_.resolve_software_cache_stage_use_local();
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool is_remote_cache_candidate() const {
+    return iterator_.is_remote_cache_candidate();
+  }
+
+  CUTLASS_HOST_DEVICE
+  AccessType *get_software_cache_local_ptr() const {
+    return reinterpret_cast<AccessType *>(iterator_.get_software_cache_local_ptr());
+  }
+
+  CUTLASS_HOST_DEVICE
+  int *get_software_cache_tile_state_ptr() const {
+    return iterator_.get_software_cache_tile_state_ptr();
+  }
+
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_tile_index() const {
+    return iterator_.get_software_cache_tile_index();
   }
 
   /// Advances to the next tile in memory.

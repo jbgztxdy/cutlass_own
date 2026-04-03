@@ -49,6 +49,7 @@ fp32 data by using NVIDIA Ampere architecture.
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal.h"
+#include "cutlass/gemm/software_cache.h"
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/host_tensor.h"
@@ -102,6 +103,7 @@ struct Options {
   int tile_config;
   int storage_device;   // GPU to store data
   int compute_device;  // GPU to run kernel
+  bool software_cache;
   
   Options():
     help(false),
@@ -113,6 +115,7 @@ struct Options {
     tile_config(0),
     storage_device(0),
     compute_device(1),
+    software_cache(false),
     alpha(1),
     beta() { }
 
@@ -140,6 +143,7 @@ struct Options {
     cmd.get_cmd_line_argument("tile-config", tile_config);
     cmd.get_cmd_line_argument("storage-device", storage_device);
     cmd.get_cmd_line_argument("compute-device", compute_device);
+    cmd.get_cmd_line_argument("software-cache", software_cache);
 
     // Support both "--key=value" and "--key value" forms.
     for (int i = 1; i + 1 < argc; ++i) {
@@ -195,6 +199,7 @@ struct Options {
       << "                               22 -> TB(256,256,16), Warp(64,128,16), Inst(16,8,8)\n"
       << "  --storage-device=<int>       GPU device to store data (default: 0)\n"
       << "  --compute-device=<int>       GPU device to run kernel (default: 1)\n"
+      << "  --software-cache=<0|1>      Enable lazy full-mirror software cache for remote A/B reads (default: 0)\n"
       << "  --iterations=<int>          Number of profiling iterations to perform.\n\n";
 
     out << "\n\nExamples:\n\n"
@@ -358,6 +363,8 @@ cutlass::Status run_gemm(
     ElementComputeEpilogue alpha,
     ElementComputeEpilogue beta,
     int avail_sms,
+    cutlass::gemm::SoftwareCacheDescriptor const &software_cache_A,
+    cutlass::gemm::SoftwareCacheDescriptor const &software_cache_B,
     cutlass::device_memory::allocation<uint8_t> &workspace) {
 
   int split_k_slices = 1;
@@ -381,6 +388,9 @@ cutlass::Status run_gemm(
       tensor_d.layout().stride(0),
       avail_sms};
 
+  arguments.software_cache_A = software_cache_A;
+  arguments.software_cache_B = software_cache_B;
+
   cutlass::Status status = gemm_op.can_implement(arguments);
   CUTLASS_CHECK(status);
 
@@ -391,6 +401,96 @@ cutlass::Status run_gemm(
   CUTLASS_CHECK(status);
 
   return status;
+}
+
+template <typename ShapeThreadblock>
+cudaError_t initialize_software_cache_for_threadblock(
+    cutlass::gemm::GemmCoord const &problem_size,
+    cutlass::HostTensor<ElementInputA, LayoutInputA> const &tensor_a,
+    cutlass::HostTensor<ElementInputB, LayoutInputB> const &tensor_b,
+    cutlass::gemm::SoftwareCacheDescriptor &software_cache_A,
+    cutlass::gemm::SoftwareCacheDescriptor &software_cache_B,
+    void *&software_cache_A_local,
+    void *&software_cache_B_local,
+    int *&software_cache_A_states,
+    int *&software_cache_B_states) {
+
+  size_t bytes_A = size_t(problem_size.m()) * size_t(problem_size.k()) * sizeof(ElementInputA);
+  size_t bytes_B = size_t(problem_size.k()) * size_t(problem_size.n()) * sizeof(ElementInputB);
+
+  int a_tile_contiguous = ShapeThreadblock::kK;
+  int a_tile_strided = ShapeThreadblock::kM;
+  int a_tile_count_contiguous = (problem_size.k() + a_tile_contiguous - 1) / a_tile_contiguous;
+  int a_tile_count_strided = (problem_size.m() + a_tile_strided - 1) / a_tile_strided;
+
+  int b_tile_contiguous = ShapeThreadblock::kK;
+  int b_tile_strided = ShapeThreadblock::kN;
+  int b_tile_count_contiguous = (problem_size.k() + b_tile_contiguous - 1) / b_tile_contiguous;
+  int b_tile_count_strided = (problem_size.n() + b_tile_strided - 1) / b_tile_strided;
+
+  cudaError_t status = cudaMalloc(&software_cache_A_local, bytes_A);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = cudaMalloc(&software_cache_B_local, bytes_B);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = cudaMalloc(&software_cache_A_states, sizeof(int) * size_t(a_tile_count_contiguous) * size_t(a_tile_count_strided));
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = cudaMalloc(&software_cache_B_states, sizeof(int) * size_t(b_tile_count_contiguous) * size_t(b_tile_count_strided));
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = cudaMemset(
+    software_cache_A_states,
+    0,
+    sizeof(int) * size_t(a_tile_count_contiguous) * size_t(a_tile_count_strided));
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = cudaMemset(
+    software_cache_B_states,
+    0,
+    sizeof(int) * size_t(b_tile_count_contiguous) * size_t(b_tile_count_strided));
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  software_cache_A.remote_base = tensor_a.device_data();
+  software_cache_A.remote_bytes = bytes_A;
+  software_cache_A.local_base = software_cache_A_local;
+  software_cache_A.local_minus_remote_offset =
+      reinterpret_cast<intptr_t>(software_cache_A_local) -
+      reinterpret_cast<intptr_t>(tensor_a.device_data());
+  software_cache_A.tile_states = software_cache_A_states;
+  software_cache_A.tile_shape_contiguous = a_tile_contiguous;
+  software_cache_A.tile_shape_strided = a_tile_strided;
+  software_cache_A.tile_count_contiguous = a_tile_count_contiguous;
+  software_cache_A.tile_count_strided = a_tile_count_strided;
+  software_cache_A.enabled = 1;
+
+  software_cache_B.remote_base = tensor_b.device_data();
+  software_cache_B.remote_bytes = bytes_B;
+  software_cache_B.local_base = software_cache_B_local;
+  software_cache_B.local_minus_remote_offset =
+      reinterpret_cast<intptr_t>(software_cache_B_local) -
+      reinterpret_cast<intptr_t>(tensor_b.device_data());
+  software_cache_B.tile_states = software_cache_B_states;
+  software_cache_B.tile_shape_contiguous = b_tile_contiguous;
+  software_cache_B.tile_shape_strided = b_tile_strided;
+  software_cache_B.tile_count_contiguous = b_tile_count_contiguous;
+  software_cache_B.tile_count_strided = b_tile_count_strided;
+  software_cache_B.enabled = 1;
+
+  return cudaSuccess;
 }
 
 int run(Options &options) {
@@ -479,6 +579,13 @@ int run(Options &options) {
   // Stream-K load balancing width. This controls persistent-style worker population.
   int avail_sms = options.persistent_blocks;
 
+  cutlass::gemm::SoftwareCacheDescriptor software_cache_A;
+  cutlass::gemm::SoftwareCacheDescriptor software_cache_B;
+  void *software_cache_A_local = nullptr;
+  void *software_cache_B_local = nullptr;
+  int *software_cache_A_states = nullptr;
+  int *software_cache_B_states = nullptr;
+
   cutlass::device_memory::allocation<uint8_t> workspace(1);
 
   #define DECLARE_GEMM_INSTANCE(ID, TB, WARP) GemmCfg##ID gemm_cfg_##ID;
@@ -492,7 +599,13 @@ int run(Options &options) {
   switch (selected_config) {
   #define INIT_CASE(ID, TB, WARP) \
     case ID: \
-      status = run_gemm(gemm_cfg_##ID, problem_size, tensor_a, tensor_b, tensor_c, tensor_d, alpha, beta, avail_sms, workspace); \
+      if (options.software_cache && options.compute_device != options.storage_device) { \
+        CUDA_CHECK(cudaSetDevice(options.compute_device)); \
+        CUDA_CHECK(initialize_software_cache_for_threadblock<TB>( \
+          problem_size, tensor_a, tensor_b, software_cache_A, software_cache_B, \
+          software_cache_A_local, software_cache_B_local, software_cache_A_states, software_cache_B_states)); \
+      } \
+      status = run_gemm(gemm_cfg_##ID, problem_size, tensor_a, tensor_b, tensor_c, tensor_d, alpha, beta, avail_sms, software_cache_A, software_cache_B, workspace); \
       break;
   TILE_CONFIG_LIST(INIT_CASE)
   #undef INIT_CASE
@@ -615,6 +728,22 @@ int run(Options &options) {
   }
 
   std::cout << (passed ? "Passed" : "Failed") << std::endl;
+
+  if (software_cache_A_states || software_cache_B_states || software_cache_A_local || software_cache_B_local) {
+    CUDA_CHECK(cudaSetDevice(options.compute_device));
+    if (software_cache_A_states) {
+      CUDA_CHECK(cudaFree(software_cache_A_states));
+    }
+    if (software_cache_B_states) {
+      CUDA_CHECK(cudaFree(software_cache_B_states));
+    }
+    if (software_cache_A_local) {
+      CUDA_CHECK(cudaFree(software_cache_A_local));
+    }
+    if (software_cache_B_local) {
+      CUDA_CHECK(cudaFree(software_cache_B_local));
+    }
+  }
 
   return (passed ? 0  : -1);
 }
