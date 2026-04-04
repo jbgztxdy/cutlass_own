@@ -66,8 +66,7 @@ Passed
 ```
 加入大缓存：
 ```
-(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=12 --storage-device=0 --compute-device=1 --software
--cache=1
+(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=12 --storage-device=0 --compute-device=1 --software-cache=1
 5120 x 4096 x 4096 TF32 tensor op Matrix Multiply
 Storage GPU: 0, Compute GPU: 1
 Note: Kernel will access data remotely via PCIe/UVA

@@ -87,6 +87,17 @@ CUTLASS_DEVICE typename Iterator::AccessType *software_cache_local_ptr(Iterator 
 }
 
 template <typename Iterator>
+CUTLASS_DEVICE auto software_cache_remote_ptr(Iterator const &iterator, int)
+  -> decltype(iterator.get_remote()) {
+  return iterator.get_remote();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE typename Iterator::AccessType *software_cache_remote_ptr(Iterator const &iterator, long) {
+  return iterator.get();
+}
+
+template <typename Iterator>
 CUTLASS_DEVICE auto software_cache_tile_state_ptr(Iterator const &iterator, int)
   -> decltype(iterator.get_software_cache_tile_state_ptr()) {
   return iterator.get_software_cache_tile_state_ptr();
@@ -408,7 +419,11 @@ public:
         if (iterator.valid()) {
           typename Iterator::AccessType *local_ptr = software_cache_local_ptr(iterator, 0);
           if (local_ptr) {
-            *local_ptr = smem_ptr[v];
+            typename Iterator::AccessType *remote_ptr =
+              software_cache_remote_ptr(iterator, 0);
+            if (remote_ptr) {
+              *local_ptr = *remote_ptr;
+            }
           }
         }
 
