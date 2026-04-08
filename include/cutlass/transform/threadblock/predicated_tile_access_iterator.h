@@ -586,16 +586,18 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
   /// Returns a pointer
   CUTLASS_HOST_DEVICE
   AccessType *get() const {
+    // Check mode first (register read) before any constant-memory loads.
+    // mode==1 (local) is the hot path when the cache is warm.
+    if (software_cache_stage_mode_ == 1) {
+      return reinterpret_cast<AccessType *>(
+        reinterpret_cast<char *>(get_remote()) +
+        params_.software_cache.local_minus_remote_offset);
+    }
+
     AccessType *remote_ptr = get_remote();
 
     if (!software_cache_enabled() || !remote_ptr) {
       return remote_ptr;
-    }
-
-    if (software_cache_stage_mode_ == 1) {
-      return reinterpret_cast<AccessType *>(
-        reinterpret_cast<char *>(remote_ptr) +
-        params_.software_cache.local_minus_remote_offset);
     }
 
     if (software_cache_stage_mode_ == 0) {
@@ -676,6 +678,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
   }
 
   CUTLASS_HOST_DEVICE
+  bool software_cache_all_tiles_valid() const {
+    return params_.software_cache.is_enabled() && params_.software_cache.all_tiles_valid;
+  }
+
+  CUTLASS_HOST_DEVICE
   void set_software_cache_stage_mode(bool use_local) {
     software_cache_stage_mode_ = use_local ? 1 : 0;
   }
@@ -717,8 +724,13 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
     }
 
     TensorCoord coord = get_current_coord();
-    int tile_contiguous = coord.contiguous() / params_.software_cache.tile_shape_contiguous;
-    int tile_strided = coord.strided() / params_.software_cache.tile_shape_strided;
+    // Use right-shift when tile shapes are power-of-2 (shift > 0), otherwise plain divide.
+    int tile_contiguous = params_.software_cache.tile_shape_contiguous_shift > 0
+      ? (coord.contiguous() >> params_.software_cache.tile_shape_contiguous_shift)
+      : (coord.contiguous() / params_.software_cache.tile_shape_contiguous);
+    int tile_strided = params_.software_cache.tile_shape_strided_shift > 0
+      ? (coord.strided() >> params_.software_cache.tile_shape_strided_shift)
+      : (coord.strided() / params_.software_cache.tile_shape_strided);
 
     if (tile_contiguous < 0 || tile_contiguous >= params_.software_cache.tile_count_contiguous) {
       return false;
@@ -775,6 +787,13 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::PitchLinear,
     }
 
     return params_.software_cache.tile_states + tile_idx;
+  }
+
+  /// Returns the current stage routing decision:
+  ///  -1 = dynamic lookup, 0 = use remote, 1 = use local mirror.
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_stage_mode() const {
+    return software_cache_stage_mode_;
   }
 
   /// Increment and return an instance to self.
@@ -1021,6 +1040,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajor,
   }
 
   CUTLASS_HOST_DEVICE
+  bool software_cache_all_tiles_valid() const {
+    return iterator_.software_cache_all_tiles_valid();
+  }
+
+  CUTLASS_HOST_DEVICE
   void set_software_cache_stage_mode(bool use_local) {
     iterator_.set_software_cache_stage_mode(use_local);
   }
@@ -1053,6 +1077,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajor,
   CUTLASS_HOST_DEVICE
   int get_software_cache_tile_index() const {
     return iterator_.get_software_cache_tile_index();
+  }
+
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_stage_mode() const {
+    return iterator_.get_software_cache_stage_mode();
   }
 
   /// Advances to the next tile in memory.
@@ -1261,6 +1290,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajor,
   }
 
   CUTLASS_HOST_DEVICE
+  bool software_cache_all_tiles_valid() const {
+    return iterator_.software_cache_all_tiles_valid();
+  }
+
+  CUTLASS_HOST_DEVICE
   void set_software_cache_stage_mode(bool use_local) {
     iterator_.set_software_cache_stage_mode(use_local);
   }
@@ -1293,6 +1327,11 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajor,
   CUTLASS_HOST_DEVICE
   int get_software_cache_tile_index() const {
     return iterator_.get_software_cache_tile_index();
+  }
+
+  CUTLASS_HOST_DEVICE
+  int get_software_cache_stage_mode() const {
+    return iterator_.get_software_cache_stage_mode();
   }
 
   /// Advances to the next tile in memory.

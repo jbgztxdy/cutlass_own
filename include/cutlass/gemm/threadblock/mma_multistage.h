@@ -109,6 +109,28 @@ CUTLASS_DEVICE int *software_cache_tile_state_ptr(Iterator const &, long) {
 }
 
 template <typename Iterator>
+CUTLASS_DEVICE auto get_software_cache_stage_mode_val(Iterator const &iterator, int)
+  -> decltype(iterator.get_software_cache_stage_mode()) {
+  return iterator.get_software_cache_stage_mode();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE int get_software_cache_stage_mode_val(Iterator const &, long) {
+  return -1;
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE auto software_cache_all_tiles_valid_val(Iterator const &iterator, int)
+  -> decltype(iterator.software_cache_all_tiles_valid()) {
+  return iterator.software_cache_all_tiles_valid();
+}
+
+template <typename Iterator>
+CUTLASS_DEVICE bool software_cache_all_tiles_valid_val(Iterator const &, long) {
+  return false;
+}
+
+template <typename Iterator>
 CUTLASS_DEVICE auto set_software_cache_stage_mode(
   Iterator &iterator, bool use_local, int)
   -> decltype(iterator.set_software_cache_stage_mode(use_local), void()) {
@@ -366,8 +388,13 @@ public:
   template <typename Iterator>
   CUTLASS_DEVICE
   void prepare_software_cache_stage(Iterator &iterator) {
-    bool use_local = software_cache_enabled(iterator, 0) &&
-                     resolve_software_cache_stage_use_local(iterator, 0);
+    if (!software_cache_enabled(iterator, 0)) return;
+    // Fast path: if all tiles were pre-loaded, skip the per-tile state lookup.
+    if (software_cache_all_tiles_valid_val(iterator, 0)) {
+      set_software_cache_stage_mode(iterator, true, 0);
+      return;
+    }
+    bool use_local = resolve_software_cache_stage_use_local(iterator, 0);
     set_software_cache_stage_mode(iterator, use_local, 0);
   }
 
@@ -392,11 +419,17 @@ public:
 
       if (tile_state) {
         tile_state_ptr = tile_state;
-        int prior_state = atomicCAS(
-          tile_state,
-          int(gemm::kSoftwareCacheLineInvalid),
-          int(gemm::kSoftwareCacheLineFilling));
-        should_fill_tile = (prior_state == int(gemm::kSoftwareCacheLineInvalid));
+        // Hot-path: plain load first to avoid expensive atomicCAS on warm tiles.
+        // atomicCAS is only issued when state is actually Invalid.
+        int current_state = *tile_state;
+        if (current_state == int(gemm::kSoftwareCacheLineInvalid)) {
+          int prior_state = atomicCAS(
+            tile_state,
+            int(gemm::kSoftwareCacheLineInvalid),
+            int(gemm::kSoftwareCacheLineFilling));
+          should_fill_tile = (prior_state == int(gemm::kSoftwareCacheLineInvalid));
+        }
+        // current_state == Valid or Filling: should_fill_tile stays 0
       }
     }
 
@@ -673,13 +706,16 @@ public:
 
 
   /// Wait until we have at least one completed global fetch stage
+  /// skip_fill: when true, both A and B tiles were already in local HBM (stage_mode==1),
+  ///            so skip cache_fetched_stage but still advance cache iterators.
   CUTLASS_DEVICE
   void gmem_wait(
     IteratorA &cache_iterator_A,
     IteratorB &cache_iterator_B,
     SmemIteratorA &cache_smem_iterator_A,
     SmemIteratorB &cache_smem_iterator_B,
-    int &cache_smem_stage_idx)
+    int &cache_smem_stage_idx,
+    bool skip_fill = false)
   {
     // Wait until we have at least one committed global fetch stage. (#uncommitted = Base::kStages - 1 - #committed)
     cutlass::arch::cp_async_wait<Base::kStages - 2>();
@@ -687,6 +723,31 @@ public:
     bool cache_A = software_cache_enabled(cache_iterator_A, 0);
     bool cache_B = software_cache_enabled(cache_iterator_B, 0);
     if (!(cache_A || cache_B)) {
+      __syncthreads();
+      return;
+    }
+
+    // Ultra-fast path: all tiles pre-loaded (all_tiles_valid flag set on both iterators).
+    // Skip everything including cache iterator advance - they are never used for fill.
+    if (software_cache_all_tiles_valid_val(cache_iterator_A, 0) &&
+        software_cache_all_tiles_valid_val(cache_iterator_B, 0)) {
+      __syncthreads();
+      return;
+    }
+
+    if (skip_fill) {
+      // Both tiles already in local HBM (stage_mode==1 on main iterators).
+      // No fill needed: just advance cache iterators to stay in sync.
+      cache_iterator_A.add_tile_offset({0, 1});
+      cache_iterator_B.add_tile_offset({1, 0});
+      cache_smem_iterator_A.add_tile_offset({0, 1});
+      cache_smem_iterator_B.add_tile_offset({1, 0});
+      ++cache_smem_stage_idx;
+      if (cache_smem_stage_idx == Base::kStages) {
+        cache_smem_iterator_A.add_tile_offset({0, -Base::kStages});
+        cache_smem_iterator_B.add_tile_offset({-Base::kStages, 0});
+        cache_smem_stage_idx = 0;
+      }
       __syncthreads();
       return;
     }
@@ -792,13 +853,20 @@ public:
         // Inserts a memory fence between stages of cp.async instructions.
         cutlass::arch::cp_async_fence();
 
+        // If both main iterators are already routing to local HBM (stage_mode==1),
+        // skip the fill logic inside gmem_wait (saves 2 syncthreads on the warm path).
+        bool skip_fill =
+          (get_software_cache_stage_mode_val(iterator_A, 0) == 1) &&
+          (get_software_cache_stage_mode_val(iterator_B, 0) == 1);
+
         // Wait until we have at least one completed global fetch stage
         gmem_wait(
           cache_iterator_A,
           cache_iterator_B,
           cache_smem_iterator_A,
           cache_smem_iterator_B,
-          cache_smem_stage_idx);
+          cache_smem_stage_idx,
+          skip_fill);
 
         // Move to the next global fetch stage
         advance_smem_write_stage(iterator_A, iterator_B);
