@@ -40,6 +40,7 @@
 #include "cutlass/array.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/software_cache.h"
 #include "cutlass/matrix_shape.h"
 #include "cutlass/numeric_types.h"
 

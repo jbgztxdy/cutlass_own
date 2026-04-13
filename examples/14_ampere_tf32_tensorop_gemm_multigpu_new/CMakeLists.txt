@@ -37,3 +37,18 @@ cutlass_example_add_executable(
   cp_async_nvlink_bandwidth
   cp_async_nvlink_bandwidth.cu
   )
+
+cutlass_example_add_executable(
+  tile_overlap_benchmark
+  tile_overlap_benchmark.cu
+  )
+
+cutlass_example_add_executable(
+  tile_overlap_fused_remote_smem_benchmark
+  tile_overlap_fused_remote_smem_benchmark.cu
+  )
+
+cutlass_example_add_executable(
+  k_slice_stationary_benchmark
+  k_slice_stationary_benchmark.cu
+  )
