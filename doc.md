@@ -64,3 +64,18 @@ Runtime: 16.9419 ms
  GFLOPs: 10140.5
 Passed
 ```
+
+## kernlet
+访存思路改为K-slice，但是各个cta计算逻辑和原来cutlass一样。即每次访问A的一整列tile和B的一整行tile，读到本卡HBM（cpu发copy请求）之后再跑各个CTA的一个iteration。如此不需要reduce且可以更好重叠，也不需要加入缓存系统。
+问题：CTA超出SM数目时会有wave问题，限制了可以用来overlap通信的计算时间。
+设计：不用ring buffer（会导致死锁）；A矩阵用column major，B矩阵用row major，这样每次cpu发请求时copy的是连续地址。
+结果（可运行`bash /home/yjw/workspace/cutlass/examples/14_ampere_tf32_tensorop_gemm_multigpu_new/run_all_tile_configs.sh`）：
+```
+(base) yjw@node192:~/workspace/cutlass/build$ ./examples/14_ampere_tf32_tensorop_gemm_multigpu_new/14_ampere_tf32_tensorop_gemm_multigpu_new --tile-config=13 --storage-device=0 --compute-device=1
+5120 x 4096 x 4096 TF32 tensor op Matrix Multiply
+Storage GPU: 0, Compute GPU: 1
+Note: Host prefetches contiguous K-panels from storage GPU to compute GPU HBM before launch
+Runtime: 2.95479 ms
+ GFLOPs: 58142.4
+Passed
+```
