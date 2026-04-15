@@ -27,9 +27,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
 cutlass_example_add_executable(
   14_ampere_tf32_tensorop_gemm_multigpu_new
   ampere_tf32_tensorop_gemm.cu
   )
-
