@@ -47,6 +47,7 @@ fp32 data by using NVIDIA Ampere architecture.
 
 #include <cstring>
 #include <iostream>
+#include <cuda.h>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
@@ -60,6 +61,7 @@ fp32 data by using NVIDIA Ampere architecture.
 #include "cutlass/util/tensor_view_io.h"
 
 #include "helper.h"
+#include "host_prefetch_gemm.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -228,8 +230,8 @@ using ElementOutput = float;                        // <- data type of elements 
 // Matrix A, Row Major for Matrix B and Row Major for Matrix C
 using LayoutInputAHost = cutlass::layout::ColumnMajor;
 using LayoutInputBHost = cutlass::layout::RowMajor;
-using LayoutInputAKernel = LayoutInputAHost;
-using LayoutInputBKernel = LayoutInputBHost;
+using LayoutInputAKernel = cutlass::layout::ColumnMajorRingBufferA;
+using LayoutInputBKernel = cutlass::layout::RowMajorRingBufferB;
 using LayoutOutput = cutlass::layout::RowMajor;
 
 // This code section describes whether you want to use tensor cores or regular SIMT cores on GPU SM
@@ -348,18 +350,41 @@ using GemmKernel = cutlass::gemm::device::Gemm<ElementInputA,
 TILE_CONFIG_LIST(DECLARE_GEMM_CFG)
 #undef DECLARE_GEMM_CFG
 
+#define CU_CHECK(status)                                                        \
+  {                                                                             \
+    CUresult error = status;                                                    \
+    if (error != CUDA_SUCCESS) {                                                \
+      const char *error_string = nullptr;                                       \
+      cuGetErrorString(error, &error_string);                                   \
+      std::cerr << "Got bad driver status: "                                    \
+                << (error_string ? error_string : "unknown")                    \
+                << " at line: " << __LINE__ << std::endl;                       \
+      exit(EXIT_FAILURE);                                                       \
+    }                                                                           \
+  }
+
 namespace {
+inline void stream_write_value32(cudaStream_t stream, int *device_ptr, int value) {
+  CU_CHECK(cuStreamWriteValue32(
+      reinterpret_cast<CUstream>(stream),
+      reinterpret_cast<CUdeviceptr>(device_ptr),
+      static_cast<cuuint32_t>(value), 0));
+}
+
 template <typename ElementA_, typename ElementB_>
 struct PrefetchWorkspace {
+  int slot_count = 0;
   int tile_k = 0;
-  size_t elements_a = 0;
-  size_t elements_b = 0;
+  size_t slot_elements_a = 0;
+  size_t slot_elements_b = 0;
   cutlass::device_memory::allocation<ElementA_> staged_a;
   cutlass::device_memory::allocation<ElementB_> staged_b;
+  cutlass::device_memory::allocation<int> ready_flags;
 
   PrefetchWorkspace()
       : staged_a(0),
-        staged_b(0) {}
+        staged_b(0),
+        ready_flags(0) {}
 
   PrefetchWorkspace(PrefetchWorkspace const &) = delete;
   PrefetchWorkspace &operator=(PrefetchWorkspace const &) = delete;
@@ -383,13 +408,24 @@ template <typename ElementA_, typename ElementB_>
 void allocate_prefetch_workspace(
     PrefetchWorkspace<ElementA_, ElementB_> &workspace,
     cutlass::gemm::GemmCoord const &problem_size,
-    int tile_k) {
+    int tile_k,
+    int slot_count) {
   workspace.tile_k = tile_k;
-  workspace.elements_a = size_t(problem_size.m()) * size_t(problem_size.k());
-  workspace.elements_b = size_t(problem_size.n()) * size_t(problem_size.k());
+  workspace.slot_count = slot_count;
+  workspace.slot_elements_a = size_t(problem_size.m()) * size_t(tile_k);
+  workspace.slot_elements_b = size_t(problem_size.n()) * size_t(tile_k);
 
-  workspace.staged_a.reset(workspace.elements_a);
-  workspace.staged_b.reset(workspace.elements_b);
+  workspace.staged_a.reset(workspace.slot_elements_a * size_t(slot_count));
+  workspace.staged_b.reset(workspace.slot_elements_b * size_t(slot_count));
+  workspace.ready_flags.reset(slot_count);
+}
+
+template <typename ElementA_, typename ElementB_>
+void reset_prefetch_workspace(
+    PrefetchWorkspace<ElementA_, ElementB_> &workspace,
+    cudaStream_t copy_stream) {
+  CUDA_CHECK(cudaMemsetAsync(workspace.ready_flags.get(), 0,
+                             sizeof(int) * workspace.slot_count, copy_stream));
 }
 
 template <typename ElementA_, typename ElementB_>
@@ -400,6 +436,7 @@ void enqueue_k_tile_copy(
     cutlass::HostTensor<ElementB_, LayoutInputBHost> &tensor_b,
     int k_tile_idx,
     cudaStream_t copy_stream) {
+  int slot = k_tile_idx % workspace.slot_count;
   int tile_k = workspace.tile_k;
   int valid_k = std::min(tile_k, problem_size.k() - k_tile_idx * tile_k);
   size_t offset_a = size_t(k_tile_idx) * size_t(tile_k) * size_t(problem_size.m());
@@ -407,15 +444,27 @@ void enqueue_k_tile_copy(
   size_t copy_bytes_a = size_t(valid_k) * size_t(problem_size.m()) * sizeof(ElementA_);
   size_t copy_bytes_b = size_t(valid_k) * size_t(problem_size.n()) * sizeof(ElementB_);
 
-  ElementA_ *dst_a = workspace.staged_a.get() + offset_a;
+  ElementA_ *dst_a = workspace.staged_a.get() +
+                     size_t(slot) * workspace.slot_elements_a;
   ElementA_ const *src_a = tensor_a.device_data() + offset_a;
   CUDA_CHECK(cudaMemcpyAsync(
       dst_a, src_a, copy_bytes_a, cudaMemcpyDeviceToDevice, copy_stream));
 
-  ElementB_ *dst_b = workspace.staged_b.get() + offset_b;
+  ElementB_ *dst_b = workspace.staged_b.get() +
+                     size_t(slot) * workspace.slot_elements_b;
   ElementB_ const *src_b = tensor_b.device_data() + offset_b;
   CUDA_CHECK(cudaMemcpyAsync(
       dst_b, src_b, copy_bytes_b, cudaMemcpyDeviceToDevice, copy_stream));
+}
+
+template <typename ElementA_, typename ElementB_>
+void publish_ready_flag(
+    PrefetchWorkspace<ElementA_, ElementB_> &workspace,
+    int slot,
+    int ready_token,
+    cudaStream_t copy_stream) {
+  stream_write_value32(copy_stream, workspace.ready_flags.get() + slot,
+                       ready_token);
 }
 
 template <typename Gemm, typename ThreadblockShape>
@@ -432,10 +481,20 @@ cutlass::Status initialize_gemm(
       problem_size,
       typename Gemm::TensorRefA(
           prefetch_workspace.staged_a.get(),
-          LayoutInputAKernel(problem_size.m())),
+          LayoutInputAKernel(
+              problem_size.m(),
+              prefetch_workspace.tile_k, prefetch_workspace.slot_count,
+              cutlass::layout::ColumnMajorRingBufferA::LongIndex(
+                  prefetch_workspace.slot_elements_a),
+              prefetch_workspace.ready_flags.get())),
       typename Gemm::TensorRefB(
           prefetch_workspace.staged_b.get(),
-          LayoutInputBKernel(problem_size.n())),
+          LayoutInputBKernel(
+              problem_size.n(),
+              prefetch_workspace.tile_k, prefetch_workspace.slot_count,
+              cutlass::layout::RowMajorRingBufferB::LongIndex(
+                  prefetch_workspace.slot_elements_b),
+              nullptr)),
       tensor_c.device_ref(),
       tensor_d.device_ref(),
       {alpha, beta},
@@ -461,20 +520,30 @@ cutlass::Status run_gemm_iteration(
     int tile_k_count,
     cudaStream_t compute_stream,
     cudaStream_t copy_stream,
-    cudaEvent_t copy_done_event,
+    cudaEvent_t first_tile_ready_event,
     cudaEvent_t start_event,
     cudaEvent_t stop_event) {
+  reset_prefetch_workspace(prefetch_workspace, copy_stream);
   CUDA_CHECK(cudaEventRecord(start_event, copy_stream));
 
-  for (int k_tile_idx = 0; k_tile_idx < tile_k_count; ++k_tile_idx) {
-    enqueue_k_tile_copy(prefetch_workspace, problem_size, tensor_a, tensor_b,
-                        k_tile_idx, copy_stream);
+  if (tile_k_count > 0) {
+    enqueue_k_tile_copy(prefetch_workspace, problem_size, tensor_a, tensor_b, 0,
+                        copy_stream);
+    publish_ready_flag(prefetch_workspace, 0, 1, copy_stream);
+    CUDA_CHECK(cudaEventRecord(first_tile_ready_event, copy_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, first_tile_ready_event, 0));
   }
-
-  CUDA_CHECK(cudaEventRecord(copy_done_event, copy_stream));
-  CUDA_CHECK(cudaStreamWaitEvent(compute_stream, copy_done_event, 0));
   cutlass::Status status = gemm_op(compute_stream);
   CUTLASS_CHECK(status);
+
+  for (int k_tile_idx = 1; k_tile_idx < tile_k_count; ++k_tile_idx) {
+    enqueue_k_tile_copy(prefetch_workspace, problem_size, tensor_a, tensor_b,
+                        k_tile_idx, copy_stream);
+    int slot = k_tile_idx % prefetch_workspace.slot_count;
+    publish_ready_flag(prefetch_workspace, slot, k_tile_idx + 1,
+                       copy_stream);
+  }
+
   CUDA_CHECK(cudaEventRecord(stop_event, compute_stream));
 
   return status;
@@ -493,10 +562,11 @@ Result run_configured_gemm(
   cutlass::Status status = cutlass::Status::kSuccess;
 
   int tile_k_count = ceil_div(problem_size.k(), ThreadblockShape::kK);
+  int slot_count = tile_k_count;
 
   PrefetchWorkspace<ElementInputA, ElementInputB> prefetch_workspace;
   allocate_prefetch_workspace(prefetch_workspace, problem_size,
-                              ThreadblockShape::kK);
+                              ThreadblockShape::kK, slot_count);
 
   cutlass::device_memory::allocation<uint8_t> gemm_workspace(1);
   status = initialize_gemm<Gemm, ThreadblockShape>(
@@ -507,13 +577,14 @@ Result run_configured_gemm(
 
   cudaStream_t compute_stream = nullptr;
   cudaStream_t copy_stream = nullptr;
-  cudaEvent_t copy_done_event = nullptr;
+  cudaEvent_t first_tile_ready_event = nullptr;
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
 
   CUDA_CHECK(cudaStreamCreate(&compute_stream));
   CUDA_CHECK(cudaStreamCreate(&copy_stream));
-  CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_event, cudaEventDisableTiming));
+  CUDA_CHECK(cudaEventCreateWithFlags(&first_tile_ready_event,
+                                      cudaEventDisableTiming));
   CUDA_CHECK(cudaEventCreate(&start_event));
   CUDA_CHECK(cudaEventCreate(&stop_event));
 
@@ -522,8 +593,8 @@ Result run_configured_gemm(
   for (int iter = 0; iter < options.iterations; ++iter) {
     status = run_gemm_iteration<Gemm, ThreadblockShape>(
         gemm_op, problem_size, tensor_a, tensor_b, prefetch_workspace,
-        tile_k_count, compute_stream, copy_stream, copy_done_event, start_event,
-        stop_event);
+        tile_k_count, compute_stream, copy_stream, first_tile_ready_event,
+        start_event, stop_event);
     CUTLASS_CHECK(status);
     CUDA_CHECK(cudaEventSynchronize(stop_event));
 
@@ -532,7 +603,7 @@ Result run_configured_gemm(
     total_runtime_ms += double(runtime_ms);
   }
 
-  CUDA_CHECK(cudaEventDestroy(copy_done_event));
+  CUDA_CHECK(cudaEventDestroy(first_tile_ready_event));
   CUDA_CHECK(cudaEventDestroy(stop_event));
   CUDA_CHECK(cudaEventDestroy(start_event));
   CUDA_CHECK(cudaStreamDestroy(copy_stream));
@@ -717,7 +788,7 @@ int main(int argc, const char **argv) {
     options.storage_device, options.compute_device);
 
   if (options.storage_device != options.compute_device) {
-    printf("Note: Host prefetches contiguous K-panels from storage GPU to compute GPU HBM before launch\n");
+    printf("Note: Host prefetches contiguous K-panels to compute GPU HBM, launches after the first panel is ready, and overlaps later panels with compute\n");
   }
 
   if (!options.valid()) {

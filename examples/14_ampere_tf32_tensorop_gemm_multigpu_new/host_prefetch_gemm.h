@@ -131,6 +131,118 @@ struct ColumnMajorRingBuffer {
   }
 };
 
+// A operand: logical shape (M, K), column-major, K advances along columns.
+struct ColumnMajorRingBufferA {
+  static int const kRank = 2;
+  static int const kStrideRank = 1;
+
+  using Index = int32_t;
+  using LongIndex = int64_t;
+  using TensorCoord = MatrixCoord;
+  using Stride = Coord<kStrideRank, LongIndex>;
+
+  Stride stride_;
+  int tile_k = 0;
+  int slot_count = 0;
+  LongIndex slot_stride = 0;
+  int *ready_flags = nullptr;
+
+  CUTLASS_HOST_DEVICE
+  ColumnMajorRingBufferA() = default;
+
+  CUTLASS_HOST_DEVICE
+  ColumnMajorRingBufferA(
+      LongIndex physical_stride,
+      int tile_k_,
+      int slot_count_,
+      LongIndex slot_stride_,
+      int *ready_flags_ = nullptr)
+      : stride_(physical_stride),
+        tile_k(tile_k_),
+        slot_count(slot_count_),
+        slot_stride(slot_stride_),
+        ready_flags(ready_flags_) {}
+
+  CUTLASS_HOST_DEVICE
+  Stride const &stride() const {
+    return stride_;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Stride &stride() {
+    return stride_;
+  }
+
+  CUTLASS_HOST_DEVICE
+  LongIndex stride(int rank) const {
+    return stride_.at(rank);
+  }
+
+  CUTLASS_HOST_DEVICE
+  LongIndex operator()(TensorCoord const &coord) const {
+    int k_tile = coord.column() / tile_k;
+    int inner_k = coord.column() % tile_k;
+    return LongIndex(k_tile % slot_count) * slot_stride +
+           LongIndex(inner_k) * stride_[0] + coord.row();
+  }
+};
+
+// B operand: logical shape (K, N), row-major, K advances along rows.
+struct RowMajorRingBufferB {
+  static int const kRank = 2;
+  static int const kStrideRank = 1;
+
+  using Index = int32_t;
+  using LongIndex = int64_t;
+  using TensorCoord = MatrixCoord;
+  using Stride = Coord<kStrideRank, LongIndex>;
+
+  Stride stride_;
+  int tile_k = 0;
+  int slot_count = 0;
+  LongIndex slot_stride = 0;
+  int *ready_flags = nullptr;
+
+  CUTLASS_HOST_DEVICE
+  RowMajorRingBufferB() = default;
+
+  CUTLASS_HOST_DEVICE
+  RowMajorRingBufferB(
+      LongIndex physical_stride,
+      int tile_k_,
+      int slot_count_,
+      LongIndex slot_stride_,
+      int *ready_flags_ = nullptr)
+      : stride_(physical_stride),
+        tile_k(tile_k_),
+        slot_count(slot_count_),
+        slot_stride(slot_stride_),
+        ready_flags(ready_flags_) {}
+
+  CUTLASS_HOST_DEVICE
+  Stride const &stride() const {
+    return stride_;
+  }
+
+  CUTLASS_HOST_DEVICE
+  Stride &stride() {
+    return stride_;
+  }
+
+  CUTLASS_HOST_DEVICE
+  LongIndex stride(int rank) const {
+    return stride_.at(rank);
+  }
+
+  CUTLASS_HOST_DEVICE
+  LongIndex operator()(TensorCoord const &coord) const {
+    int k_tile = coord.row() / tile_k;
+    int inner_k = coord.row() % tile_k;
+    return LongIndex(k_tile % slot_count) * slot_stride +
+           LongIndex(inner_k) * stride_[0] + coord.column();
+  }
+};
+
 }  // namespace layout
 }  // namespace cutlass
 namespace cutlass {
@@ -187,7 +299,7 @@ class RingPanelTileAccessIteratorPitchLinear {
 
  private:
   using BytePointer = char *;
-  using AtomicRef = cuda::atomic_ref<int, cuda::thread_scope_system>;
+  using Atomic = cuda::atomic<int, cuda::thread_scope_system>;
 
   UnderlyingPredicates the_predicates;
   Params params_;
@@ -335,6 +447,14 @@ class RingPanelTileAccessIteratorPitchLinear {
     return the_predicates.valid();
   }
 
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() {
+    if (!params_.tile_k) {
+      return;
+    }
+    wait_for_k_tile(coord_offset_.contiguous() / params_.tile_k);
+  }
+
  private:
   CUTLASS_DEVICE
   void wait_for_k_tile(int k_tile) {
@@ -342,21 +462,469 @@ class RingPanelTileAccessIteratorPitchLinear {
       return;
     }
 
-    if (thread_idx_ == 0) {
+    if ((thread_idx_ & 31) == 0) {
       int slot = k_tile % params_.slot_count;
       int target = k_tile + 1;
-      AtomicRef ready_ref(params_.ready_flags[slot]);
-      int observed = ready_ref.load(cuda::memory_order_acquire);
+      Atomic *ready_ptr = reinterpret_cast<Atomic *>(params_.ready_flags + slot);
+      int observed = ready_ptr->load(cuda::std::memory_order_acquire);
       while (observed < target) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700)
-        ready_ref.wait(observed, cuda::memory_order_relaxed);
-        observed = ready_ref.load(cuda::memory_order_acquire);
-#else
-        observed = ready_ref.load(cuda::memory_order_acquire);
-#endif
+        ready_ptr->wait(observed, cuda::std::memory_order_acquire);
+        observed = ready_ptr->load(cuda::std::memory_order_acquire);
       }
     }
-    __syncthreads();
+    __syncwarp();
+    waited_k_tile_ = k_tile;
+  }
+};
+
+template <typename Shape_, typename Element_, typename ThreadMap_, typename AccessType_>
+class RingPanelTileAccessIteratorPitchLinearKStrided {
+ public:
+  using Shape = Shape_;
+  using Element = Element_;
+  using Layout = layout::PitchLinear;
+  using ThreadMap = ThreadMap_;
+  using AccessType = AccessType_;
+  using Index = typename Layout::Index;
+  using LongIndex = typename Layout::LongIndex;
+  using TensorCoord = typename Layout::TensorCoord;
+  using Pointer = Element *;
+  using NonConstPointer = typename platform::remove_const<Element>::type *;
+
+  using UnderlyingPredicates = PredicatedTileAccessIteratorPredicates<
+      Shape, Element, Layout, 0, ThreadMap, AccessType>;
+
+  using Mask = typename UnderlyingPredicates::Mask;
+
+  static int const kAccessesPerVector =
+      ThreadMap::kElementsPerAccess / AccessType::kElements;
+
+  struct Params {
+    LongIndex physical_stride = 0;
+    int tile_k = 0;
+    int slot_count = 0;
+    LongIndex slot_stride = 0;
+    int *ready_flags = nullptr;
+
+    CUTLASS_HOST_DEVICE
+    Params() = default;
+
+    CUTLASS_HOST_DEVICE
+    Params(
+        LongIndex physical_stride_,
+        int tile_k_,
+        int slot_count_,
+        LongIndex slot_stride_,
+        int *ready_flags_)
+        : physical_stride(physical_stride_),
+          tile_k(tile_k_),
+          slot_count(slot_count_),
+          slot_stride(slot_stride_),
+          ready_flags(ready_flags_) {}
+  };
+
+ private:
+  using BytePointer = char *;
+  using Atomic = cuda::atomic<int, cuda::thread_scope_system>;
+
+  UnderlyingPredicates the_predicates;
+  Params params_;
+  BytePointer pointer_ = nullptr;
+  TensorCoord coord_offset_;
+  bool is_residue_tile_ = true;
+  int thread_idx_ = 0;
+  int waited_k_tile_ = -1;
+  int max_k_tiles_ = 0;
+
+ public:
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKStrided() = default;
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKStrided(
+      Params const &params,
+      Pointer pointer,
+      TensorCoord extent,
+      int thread_id,
+      TensorCoord const &threadblock_offset)
+      : the_predicates(extent),
+        params_(params),
+        pointer_(reinterpret_cast<BytePointer>(
+            const_cast<NonConstPointer>(pointer))),
+        coord_offset_(threadblock_offset),
+        thread_idx_(thread_id),
+        max_k_tiles_(params.tile_k ? (extent.contiguous() + params.tile_k - 1) / params.tile_k
+                                   : 0) {
+    the_predicates.set_predicates(thread_id, threadblock_offset);
+    coord_offset_ = the_predicates.thread_offset_;
+    wait_for_k_tile(params.tile_k ? threadblock_offset.contiguous() / params.tile_k
+                                  : 0);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_iteration_index(int index) {
+    the_predicates.set_iteration_index(index);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void add_pointer_offset(LongIndex) {}
+
+  CUTLASS_DEVICE
+  void add_tile_offset(TensorCoord const &tile_offset) {
+    if (is_residue_tile_) {
+      the_predicates.thread_offset_ += the_predicates.residue_offset_;
+      the_predicates.compute_predicates_(the_predicates.extent_, true);
+
+      coord_offset_.contiguous() =
+          the_predicates.thread_offset_.contiguous() +
+          Shape::kContiguous * (tile_offset.contiguous() - 1);
+      coord_offset_.strided() = the_predicates.thread_offset_.strided() +
+                                Shape::kStrided * tile_offset.strided();
+    } else {
+      coord_offset_.contiguous() +=
+          Shape::kContiguous * tile_offset.contiguous();
+      coord_offset_.strided() += Shape::kStrided * tile_offset.strided();
+    }
+
+    is_residue_tile_ = false;
+
+    if (tile_offset.contiguous() > 0) {
+      int next_k_tile = coord_offset_.contiguous() / params_.tile_k;
+      wait_for_k_tile(next_k_tile);
+    }
+  }
+
+  CUTLASS_DEVICE
+  AccessType *get() const {
+    if (!the_predicates.valid()) {
+      return nullptr;
+    }
+
+    Index coord_contig = coord_offset_.contiguous() +
+                         the_predicates.iteration_contiguous_ *
+                             ThreadMap::Delta::kContiguous +
+                         the_predicates.iteration_vector_ * AccessType::kElements;
+    Index coord_strided = coord_offset_.strided() +
+                          the_predicates.iteration_strided_ *
+                              ThreadMap::Delta::kStrided;
+
+    int k_tile = coord_contig / params_.tile_k;
+    int inner_k = coord_contig % params_.tile_k;
+
+    LongIndex offset = LongIndex(k_tile % params_.slot_count) * params_.slot_stride +
+                       LongIndex(inner_k) * params_.physical_stride +
+                       coord_strided;
+
+    return reinterpret_cast<AccessType *>(pointer_ + OffsetBytes<Element>(offset));
+  }
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKStrided &operator++() {
+    ++the_predicates.iteration_vector_;
+    if (the_predicates.iteration_vector_ < kAccessesPerVector) {
+      return *this;
+    }
+
+    the_predicates.iteration_vector_ = 0;
+    ++the_predicates.iteration_contiguous_;
+    if (the_predicates.iteration_contiguous_ < ThreadMap::Iterations::kContiguous) {
+      return *this;
+    }
+
+    the_predicates.iteration_contiguous_ = 0;
+    ++the_predicates.iteration_strided_;
+    if (the_predicates.iteration_strided_ < ThreadMap::Iterations::kStrided) {
+      return *this;
+    }
+
+    the_predicates.iteration_strided_ = 0;
+    return *this;
+  }
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKStrided operator++(int) {
+    RingPanelTileAccessIteratorPitchLinearKStrided self(*this);
+    operator++();
+    return self;
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_mask(bool enable = true) {
+    the_predicates.clear_mask(enable);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void enable_mask() {
+    the_predicates.enable_mask();
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_mask(Mask const &mask) {
+    the_predicates.set_mask(mask);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void get_mask(Mask &mask) {
+    the_predicates.get_mask(mask);
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool valid() const {
+    return the_predicates.valid();
+  }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() {
+    if (!params_.tile_k) {
+      return;
+    }
+    wait_for_k_tile(coord_offset_.contiguous() / params_.tile_k);
+  }
+
+ private:
+  CUTLASS_DEVICE
+  void wait_for_k_tile(int k_tile) {
+    if (!params_.ready_flags || k_tile <= waited_k_tile_ || k_tile >= max_k_tiles_) {
+      return;
+    }
+
+    if ((thread_idx_ & 31) == 0) {
+      int slot = k_tile % params_.slot_count;
+      int target = k_tile + 1;
+      Atomic *ready_ptr = reinterpret_cast<Atomic *>(params_.ready_flags + slot);
+      int observed = ready_ptr->load(cuda::std::memory_order_acquire);
+      while (observed < target) {
+        ready_ptr->wait(observed, cuda::std::memory_order_acquire);
+        observed = ready_ptr->load(cuda::std::memory_order_acquire);
+      }
+    }
+    __syncwarp();
+    waited_k_tile_ = k_tile;
+  }
+};
+
+template <typename Shape_, typename Element_, typename ThreadMap_, typename AccessType_>
+class RingPanelTileAccessIteratorPitchLinearKInStrided {
+ public:
+  using Shape = Shape_;
+  using Element = Element_;
+  using Layout = layout::PitchLinear;
+  using ThreadMap = ThreadMap_;
+  using AccessType = AccessType_;
+  using Index = typename Layout::Index;
+  using LongIndex = typename Layout::LongIndex;
+  using TensorCoord = typename Layout::TensorCoord;
+  using Pointer = Element *;
+  using NonConstPointer = typename platform::remove_const<Element>::type *;
+
+  using UnderlyingPredicates = PredicatedTileAccessIteratorPredicates<
+      Shape, Element, Layout, 0, ThreadMap, AccessType>;
+
+  using Mask = typename UnderlyingPredicates::Mask;
+
+  static int const kAccessesPerVector =
+      ThreadMap::kElementsPerAccess / AccessType::kElements;
+
+  struct Params {
+    LongIndex physical_stride = 0;
+    int tile_k = 0;
+    int slot_count = 0;
+    LongIndex slot_stride = 0;
+    int *ready_flags = nullptr;
+
+    CUTLASS_HOST_DEVICE
+    Params() = default;
+
+    CUTLASS_HOST_DEVICE
+    Params(
+        LongIndex physical_stride_,
+        int tile_k_,
+        int slot_count_,
+        LongIndex slot_stride_,
+        int *ready_flags_)
+        : physical_stride(physical_stride_),
+          tile_k(tile_k_),
+          slot_count(slot_count_),
+          slot_stride(slot_stride_),
+          ready_flags(ready_flags_) {}
+  };
+
+ private:
+  using BytePointer = char *;
+  using Atomic = cuda::atomic<int, cuda::thread_scope_system>;
+
+  UnderlyingPredicates the_predicates;
+  Params params_;
+  BytePointer pointer_ = nullptr;
+  TensorCoord coord_offset_;
+  bool is_residue_tile_ = true;
+  int thread_idx_ = 0;
+  int waited_k_tile_ = -1;
+  int max_k_tiles_ = 0;
+
+ public:
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKInStrided() = default;
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKInStrided(
+      Params const &params,
+      Pointer pointer,
+      TensorCoord extent,
+      int thread_id,
+      TensorCoord const &threadblock_offset)
+      : the_predicates(extent),
+        params_(params),
+        pointer_(reinterpret_cast<BytePointer>(
+            const_cast<NonConstPointer>(pointer))),
+        coord_offset_(threadblock_offset),
+        thread_idx_(thread_id),
+        max_k_tiles_(params.tile_k ? (extent.strided() + params.tile_k - 1) / params.tile_k
+                                   : 0) {
+    the_predicates.set_predicates(thread_id, threadblock_offset);
+    coord_offset_ = the_predicates.thread_offset_;
+    wait_for_k_tile(params.tile_k ? threadblock_offset.strided() / params.tile_k
+                                  : 0);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_iteration_index(int index) {
+    the_predicates.set_iteration_index(index);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void add_pointer_offset(LongIndex) {}
+
+  CUTLASS_DEVICE
+  void add_tile_offset(TensorCoord const &tile_offset) {
+    if (is_residue_tile_) {
+      the_predicates.thread_offset_ += the_predicates.residue_offset_;
+      the_predicates.compute_predicates_(the_predicates.extent_, true);
+
+      coord_offset_.contiguous() =
+          the_predicates.thread_offset_.contiguous() +
+          Shape::kContiguous * (tile_offset.contiguous() - 1);
+      coord_offset_.strided() = the_predicates.thread_offset_.strided() +
+                                Shape::kStrided * tile_offset.strided();
+    } else {
+      coord_offset_.contiguous() +=
+          Shape::kContiguous * tile_offset.contiguous();
+      coord_offset_.strided() += Shape::kStrided * tile_offset.strided();
+    }
+
+    is_residue_tile_ = false;
+
+    if (tile_offset.strided() > 0) {
+      int next_k_tile = coord_offset_.strided() / params_.tile_k;
+      wait_for_k_tile(next_k_tile);
+    }
+  }
+
+  CUTLASS_DEVICE
+  AccessType *get() const {
+    if (!the_predicates.valid()) {
+      return nullptr;
+    }
+
+    Index coord_contig = coord_offset_.contiguous() +
+                         the_predicates.iteration_contiguous_ *
+                             ThreadMap::Delta::kContiguous +
+                         the_predicates.iteration_vector_ * AccessType::kElements;
+    Index coord_strided = coord_offset_.strided() +
+                          the_predicates.iteration_strided_ *
+                              ThreadMap::Delta::kStrided;
+
+    int k_tile = coord_strided / params_.tile_k;
+    int inner_k = coord_strided % params_.tile_k;
+
+    LongIndex offset = LongIndex(k_tile % params_.slot_count) * params_.slot_stride +
+                       LongIndex(inner_k) * params_.physical_stride +
+                       coord_contig;
+
+    return reinterpret_cast<AccessType *>(pointer_ + OffsetBytes<Element>(offset));
+  }
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKInStrided &operator++() {
+    ++the_predicates.iteration_vector_;
+    if (the_predicates.iteration_vector_ < kAccessesPerVector) {
+      return *this;
+    }
+
+    the_predicates.iteration_vector_ = 0;
+    ++the_predicates.iteration_contiguous_;
+    if (the_predicates.iteration_contiguous_ < ThreadMap::Iterations::kContiguous) {
+      return *this;
+    }
+
+    the_predicates.iteration_contiguous_ = 0;
+    ++the_predicates.iteration_strided_;
+    if (the_predicates.iteration_strided_ < ThreadMap::Iterations::kStrided) {
+      return *this;
+    }
+
+    the_predicates.iteration_strided_ = 0;
+    return *this;
+  }
+
+  CUTLASS_HOST_DEVICE
+  RingPanelTileAccessIteratorPitchLinearKInStrided operator++(int) {
+    RingPanelTileAccessIteratorPitchLinearKInStrided self(*this);
+    operator++();
+    return self;
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_mask(bool enable = true) {
+    the_predicates.clear_mask(enable);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void enable_mask() {
+    the_predicates.enable_mask();
+  }
+
+  CUTLASS_HOST_DEVICE
+  void set_mask(Mask const &mask) {
+    the_predicates.set_mask(mask);
+  }
+
+  CUTLASS_HOST_DEVICE
+  void get_mask(Mask &mask) {
+    the_predicates.get_mask(mask);
+  }
+
+  CUTLASS_HOST_DEVICE
+  bool valid() const {
+    return the_predicates.valid();
+  }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() {
+    if (!params_.tile_k) {
+      return;
+    }
+    wait_for_k_tile(coord_offset_.strided() / params_.tile_k);
+  }
+
+ private:
+  CUTLASS_DEVICE
+  void wait_for_k_tile(int k_tile) {
+    if (!params_.ready_flags || k_tile <= waited_k_tile_ || k_tile >= max_k_tiles_) {
+      return;
+    }
+
+    if ((thread_idx_ & 31) == 0) {
+      int slot = k_tile % params_.slot_count;
+      int target = k_tile + 1;
+      Atomic *ready_ptr = reinterpret_cast<Atomic *>(params_.ready_flags + slot);
+      int observed = ready_ptr->load(cuda::std::memory_order_acquire);
+      while (observed < target) {
+        ready_ptr->wait(observed, cuda::std::memory_order_acquire);
+        observed = ready_ptr->load(cuda::std::memory_order_acquire);
+      }
+    }
+    __syncwarp();
     waited_k_tile_ = k_tile;
   }
 };
@@ -477,6 +1045,9 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajorRingBuffer,
 
   CUTLASS_HOST_DEVICE
   bool valid() const { return iterator_.valid(); }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() { iterator_.wait_for_current_k_tile(); }
 };
 
 template <typename Shape_, typename Element_, int AdvanceRank,
@@ -593,6 +1164,247 @@ class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajorRingBuff
 
   CUTLASS_HOST_DEVICE
   bool valid() const { return iterator_.valid(); }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() { iterator_.wait_for_current_k_tile(); }
+};
+
+template <typename Shape_, typename Element_, int AdvanceRank,
+          typename ThreadMap_, typename AccessType_, bool Gather, typename PermuteLayout>
+class PredicatedTileAccessIterator<Shape_, Element_, layout::ColumnMajorRingBufferA,
+                                   AdvanceRank, ThreadMap_, AccessType_, Gather,
+                                   PermuteLayout> {
+ public:
+  static_assert(!Gather, "Ring-buffer iterator does not support gather.");
+  static_assert(platform::is_same<PermuteLayout, layout::NoPermute>::value,
+                "Ring-buffer iterator does not support an additional permute.");
+
+  using Shape = Shape_;
+  using Element = Element_;
+  using Layout = layout::ColumnMajorRingBufferA;
+  using ThreadMap = ThreadMap_;
+  using AccessType = AccessType_;
+  using TensorCoord = MatrixCoord;
+  using Pointer = Element *;
+
+  using UnderlyingIterator = detail::RingPanelTileAccessIteratorPitchLinearKInStrided<
+      layout::PitchLinearShape<Shape::kRow, Shape::kColumn>, Element, ThreadMap,
+      AccessType>;
+
+  using Index = typename UnderlyingIterator::Index;
+  using LongIndex = typename UnderlyingIterator::LongIndex;
+  using Mask = typename UnderlyingIterator::Mask;
+  using TensorRef = cutlass::TensorRef<Element, Layout>;
+
+  static int const kAccessesPerVector = UnderlyingIterator::kAccessesPerVector;
+
+  class Params {
+   private:
+    friend PredicatedTileAccessIterator;
+    typename UnderlyingIterator::Params params_;
+
+   public:
+    CUTLASS_HOST_DEVICE
+    Params() = default;
+
+    CUTLASS_HOST_DEVICE
+    Params(Layout const &layout)
+        : params_(layout.stride(0),
+                  layout.tile_k,
+                  layout.slot_count,
+                  layout.slot_stride,
+                  layout.ready_flags) {}
+  };
+
+ private:
+  UnderlyingIterator iterator_;
+
+ public:
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator() = default;
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator(
+      Params const &params,
+      Pointer pointer,
+      TensorCoord extent,
+      int thread_id,
+      TensorCoord const &threadblock_offset,
+      int const * = nullptr)
+      : iterator_(params.params_,
+                  pointer,
+                  layout::PitchLinearCoord(extent.row(), extent.column()),
+                  thread_id,
+                  layout::PitchLinearCoord(threadblock_offset.row(),
+                                           threadblock_offset.column())) {}
+
+  CUTLASS_HOST_DEVICE
+  void set_iteration_index(int index) { iterator_.set_iteration_index(index); }
+
+  CUTLASS_HOST_DEVICE
+  void add_pointer_offset(LongIndex pointer_offset) {
+    iterator_.add_pointer_offset(pointer_offset);
+  }
+
+  CUTLASS_DEVICE
+  void add_tile_offset(TensorCoord const &tile_offset) {
+    iterator_.add_tile_offset({tile_offset.row(), tile_offset.column()});
+  }
+
+  CUTLASS_DEVICE
+  AccessType *get() const {
+    return iterator_.get();
+  }
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator &operator++() {
+    ++iterator_;
+    return *this;
+  }
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator operator++(int) {
+    PredicatedTileAccessIterator self(*this);
+    operator++();
+    return self;
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_mask(bool enable = true) { iterator_.clear_mask(enable); }
+
+  CUTLASS_HOST_DEVICE
+  void enable_mask() { iterator_.enable_mask(); }
+
+  CUTLASS_HOST_DEVICE
+  void set_mask(Mask const &mask) { iterator_.set_mask(mask); }
+
+  CUTLASS_HOST_DEVICE
+  void get_mask(Mask &mask) { iterator_.get_mask(mask); }
+
+  CUTLASS_HOST_DEVICE
+  bool valid() const { return iterator_.valid(); }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() { iterator_.wait_for_current_k_tile(); }
+};
+
+template <typename Shape_, typename Element_, int AdvanceRank,
+          typename ThreadMap_, typename AccessType_, bool Gather, typename PermuteLayout>
+class PredicatedTileAccessIterator<Shape_, Element_, layout::RowMajorRingBufferB,
+                                   AdvanceRank, ThreadMap_, AccessType_, Gather,
+                                   PermuteLayout> {
+ public:
+  static_assert(!Gather, "Ring-buffer iterator does not support gather.");
+  static_assert(platform::is_same<PermuteLayout, layout::NoPermute>::value,
+                "Ring-buffer iterator does not support an additional permute.");
+
+  using Shape = Shape_;
+  using Element = Element_;
+  using Layout = layout::RowMajorRingBufferB;
+  using ThreadMap = ThreadMap_;
+  using AccessType = AccessType_;
+  using TensorCoord = MatrixCoord;
+  using Pointer = Element *;
+
+  using UnderlyingIterator = detail::RingPanelTileAccessIteratorPitchLinearKInStrided<
+      layout::PitchLinearShape<Shape::kColumn, Shape::kRow>, Element, ThreadMap,
+      AccessType>;
+
+  using Index = typename UnderlyingIterator::Index;
+  using LongIndex = typename UnderlyingIterator::LongIndex;
+  using Mask = typename UnderlyingIterator::Mask;
+  using TensorRef = cutlass::TensorRef<Element, Layout>;
+
+  static int const kAccessesPerVector = UnderlyingIterator::kAccessesPerVector;
+
+  class Params {
+   private:
+    friend PredicatedTileAccessIterator;
+    typename UnderlyingIterator::Params params_;
+
+   public:
+    CUTLASS_HOST_DEVICE
+    Params() = default;
+
+    CUTLASS_HOST_DEVICE
+    Params(Layout const &layout)
+        : params_(layout.stride(0),
+                  layout.tile_k,
+                  layout.slot_count,
+                  layout.slot_stride,
+                  layout.ready_flags) {}
+  };
+
+ private:
+  UnderlyingIterator iterator_;
+
+ public:
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator() = default;
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator(
+      Params const &params,
+      Pointer pointer,
+      TensorCoord extent,
+      int thread_id,
+      TensorCoord const &threadblock_offset,
+      int const * = nullptr)
+      : iterator_(params.params_,
+                  pointer,
+                  layout::PitchLinearCoord(extent.column(), extent.row()),
+                  thread_id,
+                  layout::PitchLinearCoord(threadblock_offset.column(),
+                                           threadblock_offset.row())) {}
+
+  CUTLASS_HOST_DEVICE
+  void set_iteration_index(int index) { iterator_.set_iteration_index(index); }
+
+  CUTLASS_HOST_DEVICE
+  void add_pointer_offset(LongIndex pointer_offset) {
+    iterator_.add_pointer_offset(pointer_offset);
+  }
+
+  CUTLASS_DEVICE
+  void add_tile_offset(TensorCoord const &tile_offset) {
+    iterator_.add_tile_offset({tile_offset.column(), tile_offset.row()});
+  }
+
+  CUTLASS_DEVICE
+  AccessType *get() const {
+    return iterator_.get();
+  }
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator &operator++() {
+    ++iterator_;
+    return *this;
+  }
+
+  CUTLASS_HOST_DEVICE
+  PredicatedTileAccessIterator operator++(int) {
+    PredicatedTileAccessIterator self(*this);
+    operator++();
+    return self;
+  }
+
+  CUTLASS_HOST_DEVICE
+  void clear_mask(bool enable = true) { iterator_.clear_mask(enable); }
+
+  CUTLASS_HOST_DEVICE
+  void enable_mask() { iterator_.enable_mask(); }
+
+  CUTLASS_HOST_DEVICE
+  void set_mask(Mask const &mask) { iterator_.set_mask(mask); }
+
+  CUTLASS_HOST_DEVICE
+  void get_mask(Mask &mask) { iterator_.get_mask(mask); }
+
+  CUTLASS_HOST_DEVICE
+  bool valid() const { return iterator_.valid(); }
+
+  CUTLASS_DEVICE
+  void wait_for_current_k_tile() { iterator_.wait_for_current_k_tile(); }
 };
 
 }  // namespace threadblock
@@ -1024,6 +1836,70 @@ struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
                       CacheOpB>
     : DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
                      layout::RowMajor, ElementB_, layout::ColumnMajor, ElementC_,
+                     LayoutC_, arch::OpClassTensorOp, Stages, Operator_, false,
+                     CacheOpA, CacheOpB> {};
+
+template <typename ElementA, int kAlignmentA, typename ElementB, int kAlignmentB,
+          typename ElementAccumulator, typename LayoutC, typename ArchTag,
+          typename ThreadblockShape, typename WarpShape, typename InstructionShape,
+          int Stages, typename Operator, SharedMemoryClearOption SharedMemoryClear>
+struct DefaultMma<ElementA, layout::ColumnMajorRingBufferA, kAlignmentA, ElementB,
+                  layout::RowMajorRingBufferB, kAlignmentB, ElementAccumulator,
+                  LayoutC, arch::OpClassTensorOp, ArchTag, ThreadblockShape,
+                  WarpShape, InstructionShape, Stages, Operator, false,
+                  SharedMemoryClear, false, false, layout::NoPermute,
+                  layout::NoPermute> {
+  static_assert(platform::is_same<LayoutC, layout::RowMajor>::value ||
+                    platform::is_same<LayoutC, layout::AffineRankN<2>>::value,
+                "tensor-op epilogue must be row major");
+
+  static cutlass::arch::CacheOperation::Kind const CacheOpA =
+      ((sizeof_bits<ElementA>::value * kAlignmentA) == 128)
+          ? cutlass::arch::CacheOperation::Global
+          : cutlass::arch::CacheOperation::Always;
+
+  static cutlass::arch::CacheOperation::Kind const CacheOpB =
+      ((sizeof_bits<ElementB>::value * kAlignmentB) == 128)
+          ? cutlass::arch::CacheOperation::Global
+          : cutlass::arch::CacheOperation::Always;
+
+  using MmaCore = typename cutlass::gemm::threadblock::DefaultMmaCore<
+      ThreadblockShape, WarpShape, InstructionShape, ElementA,
+      layout::ColumnMajor, ElementB, layout::RowMajor, ElementAccumulator,
+      LayoutC, arch::OpClassTensorOp, Stages, Operator, false, CacheOpA,
+      CacheOpB>;
+
+  using ThreadMapA = typename MmaCore::IteratorThreadMapA;
+  using AccessTypeA = cutlass::Array<ElementA, kAlignmentA>;
+  using IteratorA = cutlass::transform::threadblock::PredicatedTileAccessIterator<
+      cutlass::MatrixShape<ThreadblockShape::kM, ThreadblockShape::kK>,
+      ElementA, layout::ColumnMajorRingBufferA, 1, ThreadMapA, AccessTypeA>;
+
+  using ThreadMapB = typename MmaCore::IteratorThreadMapB;
+  using AccessTypeB = cutlass::Array<ElementB, kAlignmentB>;
+  using IteratorB = cutlass::transform::threadblock::PredicatedTileAccessIterator<
+      cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>,
+      ElementB, layout::RowMajorRingBufferB, 0, ThreadMapB, AccessTypeB>;
+
+  using ThreadblockMma = cutlass::gemm::threadblock::MmaMultistageHostPrefetch<
+      typename MmaCore::Shape, IteratorA, typename MmaCore::SmemIteratorA,
+      MmaCore::kCacheOpA, IteratorB, typename MmaCore::SmemIteratorB,
+      MmaCore::kCacheOpB, ElementAccumulator, LayoutC,
+      typename MmaCore::MmaPolicy, Stages, SharedMemoryClear>;
+};
+
+template <typename Shape_, typename WarpShape_, typename InstructionShape_,
+          typename ElementA_, typename ElementB_, typename ElementC_,
+          typename LayoutC_, int Stages, typename Operator_,
+          cutlass::arch::CacheOperation::Kind CacheOpA,
+          cutlass::arch::CacheOperation::Kind CacheOpB>
+struct DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
+                      layout::ColumnMajorRingBufferA, ElementB_,
+                      layout::RowMajorRingBufferB, ElementC_, LayoutC_,
+                      arch::OpClassTensorOp, Stages, Operator_, false, CacheOpA,
+                      CacheOpB>
+    : DefaultMmaCore<Shape_, WarpShape_, InstructionShape_, ElementA_,
+                     layout::ColumnMajor, ElementB_, layout::RowMajor, ElementC_,
                      LayoutC_, arch::OpClassTensorOp, Stages, Operator_, false,
                      CacheOpA, CacheOpB> {};
 
